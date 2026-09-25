@@ -1,0 +1,73 @@
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Android APK/ZIP originales y extracción -- nunca commitear el juego (DMCA)
+*.apk
+*.zip
+/nova2_extract/
+
+# Todo lo decompilado/extraído del juego (derivado, regenerable, 176 MB --
+# incluye el disasm completo del .so: nunca commitear, DMCA + peso).
+# Se regenera con: jadx + devrvk/so-decompiler (ver PORTING_PLAN.md).
+/decompiled/
+
+# Librerías .so propietarias del juego original
+lib/*.so
+lib/**/*.so
+nova2_extract/lib/
+
+# Assets del juego montados para pruebas
+ux0_data/
+assets/
+
+# Build artifacts
+/build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+*.elf
+*.self
+*.vpk
+*.suprx
+
+# Debugging en consola real
+/logs/
+log_*.txt
+*.psp2dmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Config local del toolkit (contiene IP de tu Vita -- no es secreto pero es de tu red)
+.psvita-toolkit.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+cmake-build-*/
+
+# Capturas de la consola (arte del juego) -- no versionar
+/screenshots/
+
+# Arte promocional suelto en la raíz (no lo usa el build; el LiveArea final
+# vive en extras/livearea/)
+/Nova.jpg
+/Nova-2-image.webp
+*.webp
+
+# Backups de edición
+*.bak
+
+# Datos del juego (sdcard) -- no versionar
+GloftN2HP/
+compile_commands.json
+
+# vitaGL vendorizado (su Makefile se llama vitagl.mk)
+lib/vitagl/**/*.o
+lib/vitagl/libvitaGL.a
