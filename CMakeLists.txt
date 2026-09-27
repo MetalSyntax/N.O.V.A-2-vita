@@ -67,6 +67,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
+               source/video.cpp
+               source/video_avc.c
                source/dynlib.c
                source/java.c
                source/patch.c
@@ -173,6 +175,13 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceAppUtil_stub
                       SceRtc_stub
                       SceAudio_stub
+                      SceAvPlayer_stub
+                      SceVideodec_stub
+                      avcodec
+                      avutil
+                      swresample
+                      mp3lame
+                      SceSysmodule_stub
                       SceAudioIn_stub
                       SceCommonDialog_stub
                       SceDisplay_stub

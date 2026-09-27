@@ -10,6 +10,8 @@
 #include "reimpl/io.h"
 
 #include <string.h>
+#include <stdint.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
 #include <stdlib.h>
@@ -140,6 +142,70 @@ int lstat_soloader(const char *path, stat64_bionic *buf) {
     return stat_soloader(path, buf);
 }
 
+/*
+ * Caché negativo de fopen de solo lectura (log 0020): en cada sonido el motor
+ * prueba primero un .wav suelto que no existe (sfx_fs_run_stone_2.wav...) y
+ * recién después lo busca en sounds_hi.glza. Cada fopen fallido va a la
+ * memoria (síncrono) + una línea de log síncrona -> tirones en cada paso o
+ * disparo. Una ruta que falló en lectura devuelve NULL al instante hasta que
+ * algo escriba/cree/renombre/borre archivos (entonces se vacía el caché).
+ */
+#define NEG_MAX 1024
+static char *neg_path[NEG_MAX];
+static uint32_t neg_hash[NEG_MAX];
+static int neg_count;
+static SceKernelLwMutexWork neg_mtx;
+static int neg_mtx_ready;
+
+static uint32_t neg_fnv(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s)
+        h = (h ^ (uint8_t)*s++) * 16777619u;
+    return h;
+}
+
+static void neg_lock(void) {
+    if (!neg_mtx_ready) {
+        sceKernelCreateLwMutex(&neg_mtx, "neg_fopen", 0, 0, NULL);
+        neg_mtx_ready = 1;
+    }
+    sceKernelLockLwMutex(&neg_mtx, 1, NULL);
+}
+
+static int neg_has(const char *path) {
+    uint32_t h = neg_fnv(path);
+    int hit = 0;
+    neg_lock();
+    for (int i = 0; i < neg_count; i++)
+        if (neg_hash[i] == h && strcmp(neg_path[i], path) == 0) { hit = 1; break; }
+    sceKernelUnlockLwMutex(&neg_mtx, 1);
+    return hit;
+}
+
+static void neg_add(const char *path) {
+    neg_lock();
+    if (neg_count < NEG_MAX) {
+        neg_path[neg_count] = strdup(path);
+        if (neg_path[neg_count]) {
+            neg_hash[neg_count] = neg_fnv(path);
+            neg_count++;
+        }
+    }
+    sceKernelUnlockLwMutex(&neg_mtx, 1);
+}
+
+static void neg_clear(void) {
+    neg_lock();
+    for (int i = 0; i < neg_count; i++)
+        free(neg_path[i]);
+    neg_count = 0;
+    sceKernelUnlockLwMutex(&neg_mtx, 1);
+}
+
+static int mode_is_readonly(const char *mode) {
+    return mode && mode[0] == 'r' && !strchr(mode, '+');
+}
+
 FILE * fopen_soloader(const char * filename, const char * mode) {
     char remapped[PATH_MAX];
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
@@ -149,21 +215,33 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     }
     filename = soloader_remap_path(filename, remapped, sizeof(remapped));
 
+    int ro = mode_is_readonly(mode);
+    if (ro && neg_has(filename))
+        return NULL;
+    if (!ro)
+        neg_clear();
+
 #ifdef USE_SCELIBC_IO
     FILE* ret = sceLibcBridge_fopen(filename, mode);
 #else
     FILE* ret = fopen(filename, mode);
 #endif
 
-    if (ret)
-        l_debug("fopen(%s, %s): %p", filename, mode, ret);
-    else
-        l_warn("fopen(%s, %s): %p", filename, mode, ret);
+    // Sin log en éxito: el motor abre sounds_hi.glza/.gla en cada sonido
+    // durante el juego y cada línea es un sceIoWrite síncrono (tirones de FPS,
+    // log 0014). Los fallos se siguen logueando.
+    if (!ret) {
+        l_warn("fopen(%s, %s): %p (se cachea, no se vuelve a loguear)", filename, mode, ret);
+        if (ro)
+            neg_add(filename);
+    }
 
     return ret;
 }
 
 int open_soloader(const char * path, int oflag, ...) {
+    if (oflag & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC))
+        neg_clear();
     char remapped[PATH_MAX];
     if (strcmp(path, "/proc/cpuinfo") == 0) {
         return open_soloader("app0:/cpuinfo", oflag);
@@ -221,7 +299,6 @@ int fclose_soloader(FILE * f) {
     int ret = fclose(f);
 #endif
 
-    l_debug("fclose(%p): %i", f, ret);
     return ret;
 }
 
@@ -304,6 +381,7 @@ int access_soloader(const char * path, int mode) {
 }
 
 int mkdir_soloader(const char * path, mode_t mode) {
+    neg_clear();
     char remapped[PATH_MAX];
     path = soloader_remap_path(path, remapped, sizeof(remapped));
     int ret = mkdir(path, mode);
@@ -312,6 +390,7 @@ int mkdir_soloader(const char * path, mode_t mode) {
 }
 
 int remove_soloader(const char * path) {
+    neg_clear();
     char remapped[PATH_MAX];
     path = soloader_remap_path(path, remapped, sizeof(remapped));
     int ret = remove(path);
@@ -320,6 +399,7 @@ int remove_soloader(const char * path) {
 }
 
 int unlink_soloader(const char * path) {
+    neg_clear();
     char remapped[PATH_MAX];
     path = soloader_remap_path(path, remapped, sizeof(remapped));
     int ret = unlink(path);
@@ -328,6 +408,7 @@ int unlink_soloader(const char * path) {
 }
 
 int rename_soloader(const char * old_path, const char * new_path) {
+    neg_clear();
     char remapped_old[PATH_MAX], remapped_new[PATH_MAX];
     old_path = soloader_remap_path(old_path, remapped_old, sizeof(remapped_old));
     new_path = soloader_remap_path(new_path, remapped_new, sizeof(remapped_new));

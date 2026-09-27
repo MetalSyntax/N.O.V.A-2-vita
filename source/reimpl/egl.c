@@ -363,6 +363,24 @@ EGLint eglGetError(void) {
 }
 
 void (*eglGetProcAddress(char const *procname))(void) {
+    // El engine puede resolver GL por GetProcAddress: devolver nuestros
+    // wrappers o el bypass rompería el guard de FBO/viewport (Fase 12).
+    if (!procname)
+        return NULL;
+    if (!strcmp(procname, "glViewport"))
+        return (void (*)(void))&glViewport_soloader;
+    if (!strcmp(procname, "glScissor"))
+        return (void (*)(void))&glScissor_soloader;
+    if (!strcmp(procname, "glBindFramebuffer") || !strcmp(procname, "glBindFramebufferOES"))
+        return (void (*)(void))&glBindFramebuffer_soloader;
+    if (!strcmp(procname, "glCompressedTexImage2D"))
+        return (void (*)(void))&glCompressedTexImage2D_soloader;
+    if (!strcmp(procname, "glShaderSource"))
+        return (void (*)(void))&glShaderSource_soloader;
+    if (!strcmp(procname, "glCompileShader"))
+        return (void (*)(void))&glCompileShader_soloader;
+    if (!strcmp(procname, "glLinkProgram"))
+        return (void (*)(void))&glLinkProgram_soloader;
     return vglGetProcAddress(procname);
 }
 

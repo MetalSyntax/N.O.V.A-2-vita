@@ -25,24 +25,22 @@ void gl_init();
 
 void gl_preload();
 
+// Entrega la PHYCONT libre a vitaGL (llamar después del video intro).
+void gl_provide_phycont();
+
 void gl_swap();
 
 void glCompileShader_soloader(GLuint shader);
 
 void glLinkProgram_soloader(GLuint program);
 
-// Mundo lógico 960x640 -> pantalla física 960x544 (2026-09-25, confirmado por
-// log 0009 + desensamblado, mismo caso que Dungeon-Hunter-2-vita):
-// - El motor emite viewport(0,0,960,640) (espacio "iPhone retina"/HD) aunque
-//   conoce 960x544; el 2D cae al bucket default de 800x480 (barra negra
-//   derecha de 160px medida a píxel en carga/título) y el 3D pierde 96 filas.
-// - main.c reporta 960x640 al engine (nativeInit/Resize) -> Is960x640Res TRUE,
-//   layouts de 960. EGL sigue reportando lo REAL (960x544, como DH2).
-// - Estos wrappers reescalan y (×544/640) cuando se dibuja en pantalla (FBO 0);
-//   pases a FBO propios (sombras 1024) pasan intactos vía glBindFramebuffer.
-// - Touch inverso global en main.c: ly = py*640/544 (DH2).
-#define LOGICAL_W 960
-#define LOGICAL_H 640
+// Pantalla 1:1 960x544 (2026-09-25, log 0010): el mundo lógico 960x640
+// ROMPE el juego 3D (Is960x640Res -> otra cámara/FOV). Se reporta lo real y
+// viewport/scissor pasan intactos. Los fondos estáticos 800x480 (carga/
+// título: el motor no tiene bucket para 960x544 y los pinta a tamaño nativo)
+// se estiran en patch.c (hook de CSprite::PaintFrame), sin tocar el 3D.
+#define ENG_W 960
+#define ENG_H 544
 #define REAL_W 960
 #define REAL_H 544
 

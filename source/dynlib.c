@@ -168,8 +168,14 @@ static uint32_t inet_addr_soloader(const char *cp) {
 
 // GLES2 entry points the engine imports but vitaGL does not export.
 // No-ops for now; revisit if rendering shows missing blend/AA/texture updates.
+// Se llama 2 veces por frame en juego (log 0014: 6142 líneas); cada línea es
+// un sceIoWrite síncrono a ux0 -> se avisa solo la primera vez.
 static void glBlendColor_stub(float r, float g, float b, float a) {
-    l_warn("glBlendColor(%f, %f, %f, %f): not implemented", r, g, b, a);
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        l_warn("glBlendColor(%f, %f, %f, %f): not implemented (se avisa 1 vez)", r, g, b, a);
+    }
 }
 static void glCompressedTexSubImage2D_stub(unsigned target, int level, int xoff, int yoff,
                                            int w, int h, unsigned fmt, int size,

@@ -285,3 +285,162 @@
   Traer log + capturas. Pendiente si algo falla: eglGetProcAddress devuelve las
   reales de vitaGL (bypass a wrappers) — cablear a la tabla soloader si el
   `[glvp]` mostrara valores sin remapear.
+
+## Fase 13: vuelta a 960x544 1:1 + fondos estáticos estirados por sprite (2026-09-25, build OK sin consola)
+- Log 0010: el mundo 960x640 de la Fase 12 rompía el juego 3D (otra cámara/
+  desborde) y el 960x640 resultó ser un FBO del juego, no la pantalla.
+- Revertido: engine reportado 960x544 real, touch 1:1, `glViewport`/`glScissor`
+  passthrough total (el zoom por viewport tampoco servía: el fondo se pinta
+  bajo viewport 960x544).
+- Causa real de las barras (capturas kd/hd 2026-09-24): `GS_Loading::Render`/
+  `GS_Splash::Render` pintan el fondo con `CSprite::PaintFrame(bg,f,0,0,0..)`
+  a tamaño nativo 800x480; la UI ya usa g_ScreenW/H 960x544.
+- `patch.c` `patch_bg_stretch`: trampolín en `PaintFrame` (0x273038); si el
+  frame mide ~800x480 y se pinta en (0,0), los 2 `bl draw2DRectangle` de
+  `PaintModule` (0x272df8/0x272e2c) escalan el rect destino a 960x544.
+  HUD/textos/3D no se tocan. Log `[bg] stretch sprite ... frame ...` una vez
+  por fondo.
+- Probar: carga/título a pantalla completa, juego 3D igual que antes.
+
+## Fase 14: stick izq. camina + recorte de log por frame (2026-09-26, build OK sin consola)
+- Log 0014 + captura kb 2026-09-24-230504: el stick izq. giraba la cámara.
+  Causa: el ancla adaptativa de move se había ido a (180,293) por los toques
+  de MENÚ en la mitad izquierda; el press sintético caía fuera del joystick
+  (zona de FullScreenRotateJoystick). Los press reales del dedo caminando
+  están en ~(80,465), fire en ~(840,420).
+- `main.c`: anclas re-medidas 1:1 — joystick (84,462), fire (840,420),
+  acción (915,497), STICK_RADIUS 60 (aro ~70px). El ancla solo adapta con
+  press a <60px de la semilla.
+- FPS: el logger escribe cada línea con sceIoWrite síncrono. En juego había
+  ~6 líneas/frame (glBlendColor x2, [glvp] x3-4) + fopen/fclose de
+  sounds_hi.glza en cada sonido. `glBlendColor` avisa 1 vez, `[glvp]` solo
+  los primeros 24 cambios, fopen/fclose sin log en éxito (fallos sí).
+- Probar: ¿stick izq. camina?, ¿R1/Cross aciertan?, contador FPS arriba a la
+  izq. (captura mostraba 16) antes/después. Si sigue bajo: probar build
+  `--preset release` para medir sin logs.
+- Resultado en consola: stick izq. camina, 60 FPS, Cross salta. R no disparaba.
+
+## Fase 15: mapeo completo de botones (2026-09-26, build OK sin consola)
+- R no disparaba: en la Vita física L/R son `SCE_CTRL_LTRIGGER/RTRIGGER`
+  (0x100/0x200); `SCE_CTRL_L1/R1` (0x400/0x800) solo existen en PSTV/DS4.
+  La coord del disparo ya era correcta: `CButtonShoot(W-119,H-123)` =
+  (841,421) ±53 (ControlScheme4/8).
+- `main.c` (slots 6 = gestos HUD, 7 = rayo; ids <= 7):
+  - R (RTRIGGER|R1) = hold disparo (840,420).
+  - L (LTRIGGER|L1) = hold rayo/poder especial `CButtonShoot(W-105,H-225,
+    90x90)` = (855,319), evento 0x1d.
+  - Circle = tap en el ícono de arma (790,40): `CButtonHudSweep` sin
+    deslizar -> `HudPressedNoSweepCallback` -> `ReloadWeapon`.
+  - Triangle = swipe (8 frames x -16px) en el mismo ícono ->
+    `HudSweepCallback` -> `SetCurrentWeapon`.
+  - START = tap en pausa (120,25), arriba a la izquierda.
+  - Circle/Triangle/START siguen además como keys (menús).
+- Pausa/arma son nodos del HUD 3D sin coords en código: medidas en captura.
+  Si fallan, el log `[syntouch] gesture ...` muestra dónde se tocó.
+
+## Fase 16: todos los botones del HUD + controles virtuales al 1% + video intro (2026-09-26, build OK sin consola)
+- Captura hc 2026-09-26-214009 = todos los botones visibles. Cruce con pseudo-C:
+  - Rayo = `CButtonSweep(W-116,H-224)` de `CLevelInterfaceNormal` (rect =
+    frame del sprite, dibujado en ~(905,322)); tap -> `PressedNoSweepCallback`
+    (usar poder), swipe > ancho/4 -> `SweepCallback` (cambiar poder). El
+    `CButtonShoot` 0x1d de (855,319) de la Fase 15 NO era el rayo.
+  - Arma = `CButtonHudSweep` (tap recarga, swipe cambia). Granada/pausa =
+    nodos HUD 3D (`grenade_button`, `pause_idle`), medidos en captura.
+- Mapeo (`main.c`): R disparo (hold), Cross salto, L usar poder (tap
+  905,322), D-pad izq/der cambiar poder (swipe 50px), Circle recargar (tap
+  790,40), Triangle/D-pad arriba arma siguiente, D-pad abajo arma anterior
+  (swipe 128px), Square granada (tap 835,105), START pausa (tap 118,25). Las
+  keys Android se siguen mandando para menús.
+- Opacidad 1% (`patch.c` `patch_dim_controls`): `Draw(int alpha)` de cada
+  `ControlSchemeN` (joystick, disparo, salto) llega al byte alfa del SColor
+  de `CSprite::PaintModule`; se cambia el slot Draw en la vtable y se llama
+  al original con alpha*1%. El sweep del rayo se atenúa solo en la instancia
+  con frame 0xa5 (+0x58). HUD 3D (munición/granadas/pausa) intacto.
+- Video intro `GLVideo.mp4` (H.264 Baseline 640x360 60fps + AAC) SIN
+  convertir: `video.cpp` de Dungeon-Hunter-2-vita (SceAvPlayer por hardware,
+  YUV->RGB en GPU, audio por sceAudioOut; mismo motor y vitaGL). GT Racing
+  no sirve de base: sus videos son MPEG-4 Part 2 (decodifica por software).
+  Se llama tras `nativeInit/Resize` como `GameRenderer.onSurfaceCreated`
+  (MyVideoView), Cross/START lo saltan. `GLMediaPlayer.loadMovie` también
+  reproduce vía `video_play`. Busca en `GloftN2HP/`, raíz y `files/`.
+  CMake: `video.cpp`, `SceAvPlayer_stub`, `SceSysmodule_stub`.
+
+## Fase 17: video intro (memoria) + cámara por velocidad (2026-09-26, build OK sin consola)
+- Log 0016: `patch_dim` OK (8 esquemas + sweep). Video abre, SceAvPlayer lee,
+  pero `av_alloc_texture` falla: CDRAM 0x80024309 (vglInitExtended se quedó
+  con toda la CDRAM) y PHYCONT 0x80020005 (invalid flags: opt.alignment no
+  vale para PHYCONT) -> STATE_STOP, 0 frames.
+- `video.cpp`: PHYCONT sin opt en múltiplos de 1 MB; último recurso
+  `vglMemalign` (pool vitaGL, ya mapeado), liberado con `vglFree`.
+- Cámara (stick der.) como Shadow-Guardian-vita: velocidad px/frame con zona
+  muerta 15% + curva cuadrática (X 14, Y 9 px/frame máx), acumulador float y
+  wrap (suelta/re-aprieta en el ancla al salir de ±130px alrededor de
+  (600,260)) -> giro continuo sin tope. Antes: posición fija ancla+90px, la
+  cámara frenaba al llegar.
+- Probar: ¿se ve el intro? (log `video: texture memblock ok`/`uso pool
+  vitaGL`, `first video frame decoded`); velocidad/suavidad de cámara
+  (ajustar LOOK_SPEED_X/Y).
+
+## Fase 18: PHYCONT reservada para el intro (2026-09-26, build OK sin consola)
+- Log 0017: CDRAM llena (0x80024309), PHYCONT también (0x80024302, vitaGL
+  tomó todo el pool PHYCONT en init); el fallback a pool vitaGL (RAM común,
+  0x82b4...) no sirve: el decoder hardware se detiene, 0 frames.
+- `glutil.c`: `vglInitWithCustomThreshold(0,960,544, 12MB, 0, 0x7FFFFFFF,
+  cdlg)` = mismo reparto que vglInitExtended pero SIN pool PHYCONT.
+  `gl_provide_phycont()` (tras `video_play` en main.c) entrega la PHYCONT
+  libre - 1 MB con `vglPhycontMemLazyInit` (API de vitaGL para "SceAvPlayer
+  solo en el intro").
+- `video.cpp`: se quitó el fallback a vglMemalign; PHYCONT sin opt, 1 MB.
+- Probar: log `texture memblock ok (PHYCONT)`, `first video frame decoded`,
+  `vitaGL: PHYCONT pool ... KB entregado`.
+
+## Fase 19: intro por sceAvcdec directo (2026-09-26, build OK sin consola)
+- Log 0018: memoria OK (2 bloques PHYCONT), pero SceAvPlayer igual STATE_STOP
+  con 0 frames. Comparación: DH2 RE-ENCODEÓ su intro (intro_orig_1280x720.mp4
+  -> intro.mp4, H.264 Main 24 fps / AAC 48 kHz); GLVideo.mp4 es Constrained
+  Baseline 640x360 60 fps / AAC 44.1 kHz. Asphalt 5 / GT Racing usan FFmpeg
+  software, pero el libavcodec del vitasdk NO trae decoder H.264 (22
+  decoders: mpeg4, aac...).
+- Nuevo `source/video_avc.c`: demux MP4 propio (moov en memoria; validado en
+  host contra GLVideo.mp4 = ffprobe), avcC -> Annex-B con SPS/PPS, decoder
+  H.264 HARDWARE `sceAvcdec` (el de Moonlight-Vita, sin límite de fps) que
+  escribe RGBA8888 directo en la memoria de 3 texturas vitaGL (sin copia);
+  AAC con libavcodec -> s16 -> ring -> hilo sceAudioOut BGM 44.1 kHz. Sync por
+  reloj; si se atrasa >2 frames decodifica sin dibujar. Cross/START saltan.
+- `video.cpp` `video_play` prueba primero `video_play_avc`; SceAvPlayer queda
+  de fallback. CMake: `video_avc.c`, SceVideodec_stub, avcodec, avutil,
+  swresample, mp3lame.
+- Probar: log `video_avc: 640x360, 5544 frames...`, `primer frame en
+  pantalla`, `fin (N dibujados, M salteados)`. Si falla, el log trae el código
+  de sceVideodecInitLibrary / CreateDecoder / Decode.
+
+## Fase 20: intro con audio + estado GL restaurado (2026-09-26, build OK sin consola)
+- Log 0019: ¡video_avc funciona! 356 frames dibujados, 0 atrasados, 0 errores
+  hasta el skip. Pero:
+  - Sin audio: `sceAudioOutOpenPort(BGM)` -> 0x80260005: el único puerto BGM
+    ya lo tiene el AudioTrack del juego (port 256). Ahora VOICE (44.1 kHz) con
+    fallback a BGM y volumen 0 dB.
+  - Juego negro tras el skip: el motor glitch cachea el estado GL; el intro
+    dejaba otro programa, textura 0 (borrada), atributos 0/1, depth/blend...
+    Ahora `gl_save`/`gl_restore` (programa, texturas, array buffer, FBO,
+    viewport, clear color, blend/depth/cull/scissor) y atributos 14/15 que el
+    motor no usa.
+  - "Se ve enorme": el contenido de GLVideo.mp4 llena el cuadro 640x360 y
+    Android lo muestra match_parent (fit) igual que acá (960x540). Pendiente
+    captura si en la Vita aparece recortado.
+
+## Fase 21: sensibilidad de cámara regulable + menos I/O por sonido (2026-09-26, build OK sin consola)
+- Log 0020: intro OK (sin errores). Cámara "muy rápida".
+- `main.c`: velocidad = máx (14/9 px/frame, la de Fase 17) x nivel/10.
+  Niveles 1..10, default 4, SELECT + D-pad arriba/abajo (sin disparar los
+  gestos de arma), guardado en `ux0:data/nova2/camera_sens.txt`. OSD: barra
+  de 10 bloques arriba al centro 1.5 s (glScissor+glClear, estado GL
+  restaurado). Log `[cam] sensibilidad N/10`.
+- FPS (log 0020): en cada sonido el motor prueba un .wav suelto inexistente
+  (sfx_fs_run_stone_2.wav x201, ..._3 x189, jeep, disparos...) antes del
+  .glza: fopen fallido síncrono en ux0 + línea de log síncrona -> tirón por
+  cada paso/disparo. `io.c`: caché negativo de fopen de solo lectura (NULL
+  inmediato, sin tocar ux0 ni loguear); se vacía ante cualquier escritura,
+  creación, O_CREAT, mkdir, rename, remove/unlink.
+- `log.c`: ALOG INFO/DEBUG repetidos del juego ("== ATC ==" x341...) solo
+  las primeras 3 veces de cada texto.

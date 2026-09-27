@@ -2,6 +2,8 @@
 #include <falso_jni/FalsoJNI_Impl.h>
 #include <falso_jni/FalsoJNI_Logger.h>
 #include "generated_jni_table.h"
+#include "video.h"
+#include "utils/logger.h"
 
 // ---- cc.binmt.signature.Hook ----
 void stub_Hook_bind_0(jmethodID id, va_list args) {
@@ -314,9 +316,13 @@ void stub_GLMediaPlayer_loadBackground_58(jmethodID id, va_list args) {
     fjni_log_dbg("[JNI STUB] com.gameloft.android.GAND.GloftN2HP.GLMediaPlayer.loadBackground()V called -- fill in from the real Java impl (jadx).");
 }
 
+// GLMediaPlayer.loadMovie abre un visor Android fullscreen; acá se reproduce
+// en el hilo del juego con SceAvPlayer (video.cpp, bloqueante, saltable).
 void stub_GLMediaPlayer_loadMovie_59(jmethodID id, va_list args) {
-    fjni_log_dbg("[JNI STUB] com.gameloft.android.GAND.GloftN2HP.GLMediaPlayer.loadMovie(Ljava/lang/String;)V called -- fill in from the real Java impl (jadx).");
-    jobject arg0 = (jobject) va_arg(args, jobject);
+    const char *name = (const char *) va_arg(args, jobject);
+    l_error("[Java] GLMediaPlayer.loadMovie(%s)", name ? name : "(null)");
+    if (name)
+        video_play(name);
 }
 
 void stub_GLMediaPlayer_loadMusic_60(jmethodID id, va_list args) {

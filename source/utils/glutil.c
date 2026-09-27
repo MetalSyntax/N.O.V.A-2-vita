@@ -70,7 +70,15 @@ void gl_init() {
     vglSetShaderCachePath(DATA_PATH "shader_cache");
     vglUseCachedMem(GL_TRUE);
 
-    GLboolean clamped = vglInitExtended(0, 960, 544, 12 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    // = vglInitExtended(12 MB RAM libres), pero SIN pool PHYCONT: la PHYCONT
+    // queda libre para los frames de SceAvPlayer del intro (log 0016/0017:
+    // sin memoria contigua el decoder se detiene con 0 frames; un buffer en
+    // RAM común tampoco sirve). Tras el video, gl_provide_phycont() se la da
+    // a vitaGL (vglPhycontMemLazyInit, pensado para este caso).
+    GLboolean clamped = vglInitWithCustomThreshold(0, 960, 544, 12 * 1024 * 1024,
+                                                   0, 0x7FFFFFFF,
+                                                   0x8C6000 /* SCE_KERNEL_MAX_MAIN_CDIALOG_MEM_SIZE (vitaGL mem_utils.h) */,
+                                                   SCE_GXM_MULTISAMPLE_NONE);
     // NOVA2 port (crash 0007): vglInit creates shader_cache/v and /f, but
     // only when vglSetShaderCachePath ran before it. Re-create them here so
     // a fresh install (or a future reordering) can never leave the cache
@@ -78,6 +86,17 @@ void gl_init() {
     sceIoMkdir(DATA_PATH "shader_cache/v", 0777);
     sceIoMkdir(DATA_PATH "shader_cache/f", 0777);
     l_success("vitaGL initialized (960x544, no MSAA%s)", clamped ? ", resolution clamped" : "");
+}
+
+void gl_provide_phycont() {
+    SceKernelFreeMemorySizeInfo info;
+    info.size = sizeof(info);
+    sceKernelGetFreeMemorySize(&info);
+    // Se deja 1 MB de margen para el sistema; el pool va en múltiplos de 1 MB.
+    size_t sz = info.size_phycont > 0x100000 ? (info.size_phycont - 0x100000) & ~0xFFFFF : 0;
+    if (sz)
+        vglPhycontMemLazyInit(sz);
+    l_success("vitaGL: PHYCONT pool %u KB entregado tras el intro", (unsigned)(sz / 1024));
 }
 
 void gl_swap() {
@@ -174,64 +193,34 @@ void glLinkProgram_soloader(GLuint program) {
     }
 }
 
-// Ver glutil.h (mundo 960x640 -> 960x544). Solo se remapea dibujando en
-// pantalla (FBO 0); los pases a FBO del motor (p.ej. sombras 1024x1024)
-// conservan sus valores exactos o se rompen.
+// Ver glutil.h: pantalla 1:1 960x544, passthrough total. El 960x640 que
+// emite el motor es un FBO propio (log 0010) y los fondos estáticos 800x480
+// se estiran a nivel sprite (patch.c), NO por viewport: tocar viewport/
+// scissor aquí rompía el juego 3D. Solo se rastrea el FBO para el log.
 static GLuint s_bound_fbo = 0;
 
 void glBindFramebuffer_soloader(GLenum target, GLuint framebuffer) {
-    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER)
-        s_bound_fbo = framebuffer;
+    s_bound_fbo = framebuffer;
     glBindFramebuffer(target, framebuffer);
 }
 
 void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
     static GLint lx = -1, ly = -1;
     static GLsizei lw = -1, lh = -1;
-    if (s_bound_fbo == 0) {
-        float sy = (float)REAL_H / (float)LOGICAL_H;
-        GLint oy = (GLint)(y * sy + 0.5f);
-        GLsizei oh = (GLsizei)(height * sy + 0.5f);
-        if (x != lx || oy != ly || width != lw || oh != lh) {
-            lx = x; ly = oy; lw = width; lh = oh;
-            l_error("[glvp] viewport(%d, %d, %d, %d) -> (%d, %d, %d, %d)",
-                    x, y, width, height, x, oy, width, oh);
-        }
-        glViewport(x, oy, width, oh);
-    } else {
-        if (x != lx || y != ly || width != lw || height != lh) {
-            lx = x; ly = y; lw = width; lh = height;
-            l_error("[glvp] viewport FBO%u(%d, %d, %d, %d) passthrough",
-                    s_bound_fbo, x, y, width, height);
-        }
-        glViewport(x, y, width, height);
+    // El motor alterna 3-4 viewports por frame (log 0014: ~1000 líneas
+    // síncronas a ux0 en juego); solo se loguean los primeros cambios.
+    static int logged = 0;
+    if ((x != lx || y != ly || width != lw || height != lh) && logged < 24) {
+        logged++;
+        lx = x; ly = y; lw = width; lh = height;
+        l_error("[glvp] viewport FBO%u(%d, %d, %d, %d)",
+                s_bound_fbo, x, y, width, height);
     }
+    glViewport(x, y, width, height);
 }
 
 void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
-    static GLint lx = -1, ly = -1;
-    static GLsizei lw = -1, lh = -1;
-    if (s_bound_fbo == 0) {
-        float sy = (float)REAL_H / (float)LOGICAL_H;
-        int ox = x, oy = (int)(y * sy + 0.5f);
-        int ow = width, oh = (int)(height * sy + 0.5f);
-        if (ow < 0) ow = 0;
-        if (oh < 0) oh = 0;
-        if (ox < 0) { ow += ox; ox = 0; }
-        if (oy < 0) { oh += oy; oy = 0; }
-        if (ox + ow > REAL_W) ow = REAL_W - ox;
-        if (oy + oh > REAL_H) oh = REAL_H - oy;
-        if (ow < 0) ow = 0;
-        if (oh < 0) oh = 0;
-        if (ox != lx || oy != ly || ow != lw || oh != lh) {
-            lx = ox; ly = oy; lw = ow; lh = oh;
-            l_error("[glvp] scissor(%d, %d, %d, %d) -> (%d, %d, %d, %d)",
-                    x, y, width, height, ox, oy, ow, oh);
-        }
-        glScissor(ox, oy, ow, oh);
-    } else {
-        glScissor(x, y, width, height);
-    }
+    glScissor(x, y, width, height);
 }
 
 #if defined(USE_GLSL_SHADERS) && defined(DUMP_COMPILED_SHADERS)
