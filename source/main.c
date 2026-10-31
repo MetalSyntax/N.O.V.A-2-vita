@@ -543,6 +543,12 @@ static void poll_input(void) {
 int main() {
     soloader_init_all();
 
+    // El motor guarda en /data/data/<pkg>/ (remapeado a saves/ en io.c) y nunca
+    // hace mkdir: en Android esa carpeta ya existe. Sin esto, en una instalación
+    // nueva cada fopen(..., "wb") de game_save.dat/level_save.dat falla y no se
+    // guarda nada.
+    sceIoMkdir(DATA_PATH "saves", 0777);
+
     // NOTE: boot milestones use l_error so they are visible in release logs
     // too during bring-up; downgrade to l_debug once the game renders.
 

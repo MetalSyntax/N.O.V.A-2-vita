@@ -444,3 +444,20 @@
   creación, O_CREAT, mkdir, rename, remove/unlink.
 - `log.c`: ALOG INFO/DEBUG repetidos del juego ("== ATC ==" x341...) solo
   las primeras 3 veces de cada texto.
+
+## Fase 22: saves en instalación limpia (2026-10-31, build OK, eboot subido)
+- Issue "Save bug: the game doesn't save progress". En la consola de desarrollo
+  sí guarda: `saves/game_save.dat` (v0x23) tiene el último checkpoint (spawn
+  15279, log 0021), `level_save.dat` (v0xc) la sección. Escritura/lectura OK.
+- Causa: el motor guarda en `/data/data/<pkg>/` (io.c lo lleva a
+  `ux0:data/nova2/saves/`) y NUNCA hace mkdir (en Android la carpeta existe
+  siempre; Ghidra: ningún mkdir sobre g_saveDirPath). La `saves/` de la consola
+  de desarrollo se creó a mano (24/09); el README decía "created by the game".
+  En una instalación nueva cada `fopen(saves/*.dat, "wb")` falla y no se guarda
+  nada.
+- `main.c`: `sceIoMkdir(DATA_PATH "saves")` tras `soloader_init_all()`.
+- Notas del motor: checkpoint = `game_save.dat` (solo en spawnpoints, no al
+  pausar; igual que Android). Niveles desbloqueados = `levels_save.dat`, que
+  solo se escribe al terminar un nivel (GS_EndLevel -> Application::Save).
+- Probar: borrar/renombrar `ux0:data/nova2/saves/`, iniciar, llegar a un
+  checkpoint, salir y "Continue".

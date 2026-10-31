@@ -1,8 +1,19 @@
-# N.O.V.A 2 Vita v1.0
+# N.O.V.A 2 Vita v1.0.1
 
 This is a wrapper/port of **N.O.V.A. 2 – Near Orbit Vanguard Alliance HD** (Gameloft) for the PS Vita.
 
 ## Changelog
+
+- v1.0.1: Save hotfix.
+  - **Progress now saves on a fresh install.** The game saves to its Android data folder,
+    which the port maps to `ux0:data/nova2/saves/`. The game never creates that folder
+    (on Android it always exists), and the old README said it was created automatically.
+    If it was missing, every save failed silently, so after a restart there was only
+    "New Game" and no "Continue". The port now creates `ux0:data/nova2/saves/` at startup.
+  - **Already playing?** Just install the new VPK. If `ux0:data/nova2/saves/` already
+    existed on your card, your progress was being saved and is kept.
+  - Note: like on Android, the game only saves at checkpoints and when a level is finished,
+    not when pausing or quitting.
 
 - v1.0: Initial release.
   - **Plays at 60 FPS at native 960x544**, 1:1 with the Vita screen. The engine is given the

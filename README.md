@@ -136,7 +136,7 @@ ux0:data/nova2/
 │   ├── sounds_hi.glza
 │   ├── location_00X_*.gla, actors.gla, weapons.gla, menus.gla, ...
 │   └── oconf.bar
-├── saves/                 <- created by the game (*.dat)
+├── saves/                 <- created at startup (*.dat)
 ├── shader_cache/          <- created at runtime
 ├── logs/                  <- one nova2_NNNN.log per boot
 └── camera_sens.txt        <- camera sensitivity (created when you change it)
