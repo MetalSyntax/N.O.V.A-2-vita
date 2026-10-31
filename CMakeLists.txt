@@ -14,7 +14,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(VITA_APP_NAME "N.O.V.A 2")
 set(VITA_TITLEID "PSVNOVA02")
 set(VITA_VPKNAME "nova2")
-set(VITA_VERSION "01.01")
+set(VITA_VERSION "01.02")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
 # Optional: used for "send" and "dump" targets

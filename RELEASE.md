@@ -1,8 +1,18 @@
-# N.O.V.A 2 Vita v1.0.1
+# N.O.V.A 2 Vita v1.0.2
 
 This is a wrapper/port of **N.O.V.A. 2 – Near Orbit Vanguard Alliance HD** (Gameloft) for the PS Vita.
 
 ## Changelog
+
+- v1.0.2: Exit fix.
+  - **Exiting from the main menu now returns to the LiveArea.** The game's exit button
+    calls Android's `GLGame.Exit()`, which the port left empty, so the game froze on a
+    black screen. It now closes the app like on Android.
+  - **If the game suddenly crashes at boot after working fine before**, check that
+    `ux0:data/nova2/libnova2.so` is intact by copying it again from the APK
+    (`lib/armeabi-v7a/libnova2.so`). On my own console, 56 KB of that file got corrupted
+    on the memory card, which made the game crash at startup with no code change.
+    The same kind of corruption can also damage the `.gla` data files or the saves.
 
 - v1.0.1: Save hotfix.
   - **Progress now saves on a fresh install.** The game saves to its Android data folder,

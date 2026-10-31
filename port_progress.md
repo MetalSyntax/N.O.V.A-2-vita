@@ -461,3 +461,16 @@
   solo se escribe al terminar un nivel (GS_EndLevel -> Application::Save).
 - Probar: borrar/renombrar `ux0:data/nova2/saves/`, iniciar, llegar a un
   checkpoint, salir y "Continue".
+
+## Fase 23: crash al iniciar = .so corrupto en la tarjeta; salir del menú (2026-10-31)
+- Logs 0022-0030: v1.0 y v1.0.1 crasheaban igual en appInit (driver GLES2 de
+  glitch NULL -> data abort en CSceneManager, r6=0). Ojo: `psvita-toolkit
+  analyze` auto-detecta mal la base; usar `--so-base 0x98000000`.
+- Causa: `ux0:data/nova2/libnova2.so` en la Vita tenía 56 KB basura
+  (0x6a1000-0x6aefff, 14 bloques de 4 KB) = rodata: el motor recibía
+  "%u.%u" corrupto -> versión GL 0 -> driver rechazado. Corrupción de la
+  tarjeta, no del port. Se resubió el .so del APK (SHA-1 03583f66...).
+  Se descartó todo el código de diagnóstico.
+- Salir del menú principal colgaba el juego: nativeExit -> GLGame.Exit() era
+  un stub vacío. Ahora `sceKernelExitProcess(0)` (Android: killProcess).
+- main.c: faltaba `#include <psp2/io/stat.h>` para sceIoMkdir (Fase 22).

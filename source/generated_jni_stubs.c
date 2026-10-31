@@ -4,6 +4,7 @@
 #include "generated_jni_table.h"
 #include "video.h"
 #include "utils/logger.h"
+#include <psp2/kernel/processmgr.h>
 
 // ---- cc.binmt.signature.Hook ----
 void stub_Hook_bind_0(jmethodID id, va_list args) {
@@ -78,8 +79,12 @@ jobject stub_Hook_m1_11(jmethodID id, va_list args) {
 }
 
 // ---- com.gameloft.android.GAND.GloftN2HP.GLGame ----
+// GLGame.Exit (botón salir del menú, vía nativeExit): en Android termina con
+// Process.killProcess(myPid()). Sin esto el juego quedaba colgado sin volver
+// al LiveArea.
 void stub_GLGame_Exit_12(jmethodID id, va_list args) {
-    fjni_log_dbg("[JNI STUB] com.gameloft.android.GAND.GloftN2HP.GLGame.Exit()V called -- fill in from the real Java impl (jadx).");
+    l_info("GLGame.Exit: saliendo al LiveArea");
+    sceKernelExitProcess(0);
 }
 
 jint stub_GLGame_IsNetworkTypeValid_13(jmethodID id, va_list args) {
