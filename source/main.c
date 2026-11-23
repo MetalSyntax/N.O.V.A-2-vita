@@ -1,7 +1,9 @@
+#include "crash_guard.h"
 #include "utils/init.h"
 #include "utils/glutil.h"
 #include "utils/logger.h"
 #include "video.h"
+#include "port_menu.h"
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/clib.h>
@@ -43,9 +45,14 @@ int storm_loaded = 0;
 // Pantalla real 960x544 1:1 (2026-09-25): el juego 3D estaba bien así; el
 // mundo 960x640 le cambiaba la cámara (Is960x640Res) y se desbordaba.
 // Se reporta lo REAL en nativeInit/Resize. Touch 1:1.
-#define ENG_W 960
-#define ENG_H 544
 #define TOUCH_LOGICAL_Y(py) (py)
+// Aspecto ORIGINAL (menú): el motor corre a 800x480 (g_eng_w/h). Las coords
+// de abajo están medidas a 960x544; se reanclan según cómo ancla el motor
+// cada control (W-x / H-y / centro). En FULL SCREEN quedan idénticas.
+#define RX(x) ((x) - (960 - g_eng_w))
+#define BY(y) ((y) - (544 - g_eng_h))
+#define CX(x) ((x) - (960 - g_eng_w) / 2)
+#define CY(y) ((y) - (544 - g_eng_h) / 2)
 
 // ---- Input: touch (5 stable slots, never the raw hw id -- see
 // psvita-porting input_handling.md) + physical buttons as Android keycodes.
@@ -88,9 +95,10 @@ int storm_loaded = 0;
 #define LOOK_SLOT 4
 #define FIRE_SLOT 5
 #define GEST_SLOT 6
+#define ROCKET_SLOT 7
 #define N_SLOTS 8
 #define MOVE_ANCHOR_X 84
-#define MOVE_ANCHOR_Y 462
+#define MOVE_ANCHOR_Y BY(462)
 #define MOVE_ADAPT_R 60
 // Cámara (stick der.) como en Shadow-Guardian-vita: arrastre CONTINUO por
 // velocidad (px/frame según inclinación) con "wrap": al salir de la caja
@@ -100,33 +108,67 @@ int storm_loaded = 0;
 // Caja (460..740, 130..390): lejos del disparo (788+), rayo (870+), arma
 // (y~40) y joystick. Curva: zona muerta + respuesta cuadrática para apuntar
 // fino con poca inclinación.
-#define LOOK_ANCHOR_X 600
-#define LOOK_ANCHOR_Y 260
-#define LOOK_BOX 130
+#define LOOK_ANCHOR_X (600 * g_eng_w / 960)
+#define LOOK_ANCHOR_Y (260 * g_eng_h / 544)
+#define LOOK_BOX (130 * g_eng_h / 544)
 #define LOOK_DZ 0.15f
 // Velocidad MÁXIMA (nivel 10 = la de la Fase 17, "muy rápido" en log 0020).
-// Sensibilidad regulable en juego: SELECT + D-pad arriba/abajo, niveles
-// 1..10 (default 4 = 40%), guardada en DATA_PATH"camera_sens.txt". Al
-// cambiarla se ve una barra de 10 bloques arriba al centro durante 1.5 s.
+// Sensibilidad 1..10 (SELECT + D-pad arriba/abajo o menú SELECT+START),
+// guardada en config.txt (port_menu.c).
 #define LOOK_SPEED_X 14.0f
 #define LOOK_SPEED_Y 9.0f
-#define CAM_LEVEL_DEFAULT 4
-#define CAM_LEVEL_MAX 10
-#define CAM_CFG DATA_PATH "camera_sens.txt"
-#define FIRE_X 840
-#define FIRE_Y 420
-#define ACT_X 915
-#define ACT_Y 497
-#define POWER_X 905
-#define POWER_Y 322
+#define FIRE_X RX(840)
+#define FIRE_Y BY(420)
+#define ACT_X RX(915)
+#define ACT_Y BY(497)
+#define POWER_X RX(905)
+#define POWER_Y BY(322)
 #define PAUSE_X 118
 #define PAUSE_Y 25
-#define WEAPON_X 790
+#define WEAPON_X RX(790)
 #define WEAPON_Y 40
-#define GRENADE_X 835
+#define GRENADE_X RX(835)
 #define GRENADE_Y 105
-#define BTN_FIRE (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)
-#define BTN_POWER (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)
+// Botón "Interactuar" (puertas/switches): CButtonSpr de CLevelInterfaceNormal
+// en (W/2-204, H/2+100); con un mensaje en pantalla sube a H/2+20
+// (ShowInteractButton/MoveInteractButtonUp). El toque real (318,405) del log
+// 0032 activó un switch (sfx_switch_activate) -> se usa ese punto.
+#define INTERACT_X CX(318)
+#define INTERACT_Y CY(405)
+#define INTERACT_MSG_DY 80
+static const char *msg_active; // ILevelMessage::bIsMessageActive
+// Cohetes del mecha (captura gd 2026-11-22-220043): 2º CButtonShoot (tipo
+// 0x1d, 90x90) de los ControlScheme en (W-105, H-225) = (855,319). Solo está
+// activo con CLevelInterfaceMech; en esa zona, a pie, está el rayo.
+#define ROCKET_X RX(855)
+#define ROCKET_Y BY(319)
+static char *(*level_get)(void);   // CLevel::GetLevel (m_instance)
+static uintptr_t mech_vptr;         // _ZTV19CLevelInterfaceMech + 8
+
+// Disparos mudos con fuego sostenido (2026-11-22): se recuperaban solo al
+// pausar y despausar, que llama VoxSoundManager::ResumeAllSounds ->
+// vox::VoxEngine::ResumeAllEmitters. Es decir, los emisores nuevos quedan en
+// pausa. Causa raíz sin ubicar: se repite lo que hace la despausa al soltar
+// el disparo/los cohetes (en el hilo del juego, máx. 1 vez cada 2 s).
+// ponytail: mitigación; si aparece la causa (Play+Pause en
+// VoxSoundManager::Play por la máscara de ShadowMusic), quitar esto.
+static void **vox_mgr;              // VoxSoundManager::Singleton
+static void (*vox_resume_all)(void *self);
+
+static void sfx_unstick(void) {
+    static uint64_t last;
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (!vox_resume_all || !vox_mgr || !*vox_mgr || now - last < 2000000)
+        return;
+    last = now;
+    vox_resume_all(*vox_mgr);
+}
+
+static int in_mech(void) {
+    char *lv = level_get && mech_vptr ? level_get() : NULL;
+    uintptr_t *ifc = lv ? *(uintptr_t **)(lv + 0x6c) : NULL; // CLevel::ShowInteractButton
+    return ifc && *ifc == mech_vptr;
+}
 // Aro exterior del joystick ~70px: deflexión total queda dentro del aro.
 #define STICK_RADIUS 60
 #define STICK_ENGAGE 0.30f
@@ -157,7 +199,7 @@ static int syn_y[N_SLOTS] = { 0 };
 // Semilla = medida a píxel (84,462); solo los press reales a <MOVE_ADAPT_R
 // de la semilla la ajustan (los de menú quedan fuera).
 static int move_anchor_px = MOVE_ANCHOR_X;
-static int move_anchor_py = MOVE_ANCHOR_Y;
+static int move_anchor_py = 462; // = MOVE_ANCHOR_Y, se fija en main()
 
 // Drives one reserved slot from one stick. (cx,cy) = anchor in ENGINE LOGICAL
 // coords, (dx,dy) = deflection in -1..1. Engage/release with hysteresis; the
@@ -175,12 +217,10 @@ static void syn_stick(int slot, int cx, int cy, float dx, float dy) {
         slot_x[slot] = cx;
         slot_y[slot] = cy;
         touch_pressed(ENV, NULL, cx, cy, slot);
-        l_error("[syntouch] slot %d press(%d, %d)", slot, cx, cy);
     }
     if (mag < STICK_RELEASE) {
         syn_owned[slot] = 0;
         touch_released(ENV, NULL, syn_x[slot], syn_y[slot], slot);
-        l_error("[syntouch] slot %d release", slot);
         slot_hw[slot] = -1;
         slot_x[slot] = -1;
         slot_y[slot] = -1;
@@ -206,76 +246,6 @@ static void syn_stick(int slot, int cx, int cy, float dx, float dy) {
 }
 
 static float look_fx, look_fy;
-static int cam_level = CAM_LEVEL_DEFAULT;
-static uint64_t cam_osd_until;
-
-static void cam_load(void) {
-    SceUID fd = sceIoOpen(CAM_CFG, SCE_O_RDONLY, 0);
-    if (fd < 0)
-        return;
-    char b[8] = { 0 };
-    sceIoRead(fd, b, sizeof(b) - 1);
-    sceIoClose(fd);
-    int v = atoi(b);
-    if (v >= 1 && v <= CAM_LEVEL_MAX)
-        cam_level = v;
-}
-
-static void cam_save(void) {
-    SceUID fd = sceIoOpen(CAM_CFG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-    if (fd < 0)
-        return;
-    char b[8];
-    int n = sceClibSnprintf(b, sizeof(b), "%d\n", cam_level);
-    sceIoWrite(fd, b, n);
-    sceIoClose(fd);
-}
-
-static void cam_adjust(int d) {
-    int v = cam_level + d;
-    if (v < 1) v = 1;
-    if (v > CAM_LEVEL_MAX) v = CAM_LEVEL_MAX;
-    cam_level = v;
-    cam_save();
-    cam_osd_until = sceKernelGetProcessTimeWide() + 1500000;
-    l_error("[cam] sensibilidad %d/%d", cam_level, CAM_LEVEL_MAX);
-}
-
-// Barra de sensibilidad con glScissor+glClear (sin shaders). Estado GL
-// guardado/restaurado: el motor cachea el suyo (ver video_avc.c).
-static void cam_osd_draw(void) {
-    if (!cam_osd_until || sceKernelGetProcessTimeWide() > cam_osd_until)
-        return;
-    GLint fbo, box[4];
-    GLfloat cc[4];
-    GLboolean sc = glIsEnabled(GL_SCISSOR_TEST);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
-    glGetIntegerv(GL_SCISSOR_BOX, box);
-    glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
-    if (fbo)
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glEnable(GL_SCISSOR_TEST);
-    const int bw = 22, bh = 14, gap = 4;
-    int x0 = (VITA_W - (CAM_LEVEL_MAX * (bw + gap) - gap)) / 2;
-    int y0 = VITA_H - 20 - bh;   // GL: origen abajo -> 20 px desde arriba
-    glScissor(x0 - 4, y0 - 4, CAM_LEVEL_MAX * (bw + gap) - gap + 8, bh + 8);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    for (int i = 0; i < CAM_LEVEL_MAX; i++) {
-        glScissor(x0 + i * (bw + gap), y0, bw, bh);
-        if (i < cam_level)
-            glClearColor(0.2f, 0.8f, 1.0f, 1.0f);
-        else
-            glClearColor(0.25f, 0.25f, 0.25f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
-    glScissor(box[0], box[1], box[2], box[3]);
-    glClearColor(cc[0], cc[1], cc[2], cc[3]);
-    if (!sc)
-        glDisable(GL_SCISSOR_TEST);
-    if (fbo)
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-}
 
 static float look_curve(float v) {
     float a = v < 0 ? -v : v;
@@ -289,7 +259,7 @@ static float look_curve(float v) {
 }
 
 static void syn_look(float dx, float dy) {
-    float k = (float)cam_level / (float)CAM_LEVEL_MAX;
+    float k = (float)g_cam_level / (float)CAM_LEVEL_MAX;
     float vx = look_curve(dx) * LOOK_SPEED_X * k;
     float vy = look_curve(dy) * LOOK_SPEED_Y * k;
     if (vx == 0.0f && vy == 0.0f) {
@@ -361,7 +331,6 @@ static void gest_start(int x, int y, int dx, int frames) {
     gest_dx = dx;
     gest_frames = frames;
     touch_pressed(ENV, NULL, x, y, GEST_SLOT);
-    l_error("[syntouch] gesture %s at (%d, %d)", dx ? "swipe" : "tap", x, y);
 }
 
 static void gest_update(void) {
@@ -382,7 +351,27 @@ static void gest_update(void) {
 
 static void syn_buttons(uint32_t buttons, uint32_t prev) {
     uint32_t down = buttons & ~prev;
+    uint32_t up = prev & ~buttons;
     gest_update();
+    if (up & (g_bind[A_FIRE] | g_bind[A_ROCKET]))
+        sfx_unstick();
+    int mech = (buttons & g_bind[A_ROCKET]) ? in_mech() : 0;
+
+    // Cohetes (hold) en su propio slot, mientras se mantenga el botón.
+    if (mech && !syn_owned[ROCKET_SLOT]) {
+        syn_owned[ROCKET_SLOT] = 1;
+        slot_hw[ROCKET_SLOT] = -2;
+        slot_x[ROCKET_SLOT] = ROCKET_X;
+        slot_y[ROCKET_SLOT] = ROCKET_Y;
+        touch_pressed(ENV, NULL, ROCKET_X, ROCKET_Y, ROCKET_SLOT);
+    } else if (!mech && syn_owned[ROCKET_SLOT]) {
+        touch_released(ENV, NULL, slot_x[ROCKET_SLOT], slot_y[ROCKET_SLOT], ROCKET_SLOT);
+        syn_owned[ROCKET_SLOT] = 0;
+        slot_hw[ROCKET_SLOT] = slot_x[ROCKET_SLOT] = slot_y[ROCKET_SLOT] = -1;
+    }
+    // En el mecha no hay poderes: el mismo botón (L) no toca también el rayo.
+    if (mech)
+        down &= ~g_bind[A_ROCKET];
     if (buttons & SCE_CTRL_SELECT) {
         // SELECT + D-pad arriba/abajo: sensibilidad de cámara (sin gestos).
         if (down & SCE_CTRL_UP)
@@ -391,25 +380,31 @@ static void syn_buttons(uint32_t buttons, uint32_t prev) {
             cam_adjust(-1);
         down &= ~(SCE_CTRL_UP | SCE_CTRL_DOWN);
     }
-    if (down & SCE_CTRL_CIRCLE)                                   // recargar
+    // Botones remapeables desde el menú SELECT+START (g_bind, port_menu.c).
+#define DN(a) (down & g_bind[a])
+    if (DN(A_RELOAD))
         gest_start(WEAPON_X, WEAPON_Y, 0, GEST_TAP_FRAMES);
-    else if (down & (SCE_CTRL_TRIANGLE | SCE_CTRL_UP))            // arma siguiente
+    else if (DN(A_WEAPON_NEXT))
         gest_start(WEAPON_X, WEAPON_Y, -GEST_SWIPE_STEP, GEST_SWIPE_FRAMES);
-    else if (down & SCE_CTRL_DOWN)                                // arma anterior
+    else if (DN(A_WEAPON_PREV))
         gest_start(WEAPON_X, WEAPON_Y, GEST_SWIPE_STEP, GEST_SWIPE_FRAMES);
-    else if (down & BTN_POWER)                                    // usar poder
+    else if (DN(A_POWER))
         gest_start(POWER_X, POWER_Y, 0, GEST_TAP_FRAMES);
-    else if (down & SCE_CTRL_LEFT)                                // cambiar poder
+    else if (DN(A_POWER_PREV))
         gest_start(POWER_X, POWER_Y, -POWER_SWIPE_STEP, POWER_SWIPE_FRAMES);
-    else if (down & SCE_CTRL_RIGHT)
+    else if (DN(A_POWER_NEXT))
         gest_start(POWER_X, POWER_Y, POWER_SWIPE_STEP, POWER_SWIPE_FRAMES);
-    else if (down & SCE_CTRL_SQUARE)                              // granada
+    else if (DN(A_GRENADE))
         gest_start(GRENADE_X, GRENADE_Y, 0, GEST_TAP_FRAMES);
-    else if (down & SCE_CTRL_START)                               // pausa
+    else if (DN(A_INTERACT))
+        gest_start(INTERACT_X, (msg_active && *msg_active) ? INTERACT_Y - INTERACT_MSG_DY : INTERACT_Y,
+                   0, GEST_TAP_FRAMES);
+    else if (DN(A_PAUSE))
         gest_start(PAUSE_X, PAUSE_Y, 0, GEST_TAP_FRAMES);
+#undef DN
 
-    int firing = (buttons & BTN_FIRE) != 0;
-    int act = (buttons & SCE_CTRL_CROSS) != 0;
+    int firing = (buttons & g_bind[A_FIRE]) != 0;
+    int act = (buttons & g_bind[A_JUMP]) != 0;
     if (firing) {
         // Si había un tap de acción a medias, se suelta antes del FIRE para
         // no dejar un press colgado en coords de acción.
@@ -423,7 +418,6 @@ static void syn_buttons(uint32_t buttons, uint32_t prev) {
             slot_x[FIRE_SLOT] = FIRE_X;
             slot_y[FIRE_SLOT] = FIRE_Y;
             touch_pressed(ENV, NULL, FIRE_X, FIRE_Y, FIRE_SLOT);
-            l_error("[syntouch] slot %d FIRE press", FIRE_SLOT);
         }
         act_frames_left = 0;
         return;
@@ -469,10 +463,50 @@ static const struct { uint32_t sce; int android; } pad_map[] = {
     { SCE_CTRL_SELECT, 109 },  // KEYCODE_BUTTON_SELECT
 };
 
+// Al abrir el menú: soltar todo lo que el juego cree apretado (dedos, touches
+// sintéticos, keys) para que no quede nada colgado durante la pausa.
+static int wait_release = 0;
+
+static void release_all(void) {
+    for (int s = 0; s < N_SLOTS; s++) {
+        if (slot_hw[s] != -1 && slot_x[s] != -1)
+            touch_released(ENV, NULL, slot_x[s], slot_y[s], s);
+        slot_hw[s] = slot_x[s] = slot_y[s] = -1;
+        syn_owned[s] = 0;
+    }
+    gest_frames = 0;
+    act_frames_left = 0;
+    for (unsigned i = 0; i < sizeof(pad_map) / sizeof(pad_map[0]); i++)
+        if (old_pad & pad_map[i].sce)
+            key_up(ENV, NULL, pad_map[i].android);
+    old_pad = 0;
+}
+
+// 1 = el menú se abrió este frame.
+static int check_menu_combo(void) {
+    SceCtrlData pad;
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    if (wait_release) {
+        // Tras cerrar el menú: ignorar input hasta soltar todo (si no, el O
+        // que lo cerró llegaría al juego como recargar/B).
+        if (pad.buttons)
+            return 0;
+        wait_release = 0;
+    }
+    if ((pad.buttons & SCE_CTRL_SELECT) && (pad.buttons & SCE_CTRL_START) &&
+        !(old_pad & SCE_CTRL_START)) {
+        release_all();
+        menu_open();
+        wait_release = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static void poll_input(void) {
     // Touch 1:1 960x544 (el engine hit-testea en real; el *640/544 de la
     // Fase 12 se revierte con el mundo lógico por el zoom que causaba).
-    // Solo se loguea el press (los moves saturarían); coords del log = reales.
+    // Sin logs por evento: cada línea es un sceIoWrite síncrono (tirones).
     // Slots 3-6 reservados (sticks/fire/gestos): los dedos usan 0-2.
     SceTouchData touch;
     sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
@@ -481,6 +515,12 @@ static void poll_input(void) {
         int hw = touch.report[r].id;
         int x = touch.report[r].x / 2;
         int y = touch.report[r].y / 2;
+        if (g_aspect_original) {
+            // Pantalla -> motor 800x480 (imagen en x 27..933, ver ORIG_*).
+            x = (x - ORIG_X) * g_eng_w / ORIG_W;
+            y = y * g_eng_h / VITA_H;
+            x = x < 0 ? 0 : x >= g_eng_w ? g_eng_w - 1 : x;
+        }
         int slot = -1;
         for (int s = 0; s < N_SLOTS; s++)
             if (slot_hw[s] == hw) { slot = s; break; }
@@ -496,7 +536,6 @@ static void poll_input(void) {
         int ly = TOUCH_LOGICAL_Y(y);
         if (slot_x[slot] == -1) {
             touch_pressed(ENV, NULL, x, ly, slot);
-            l_error("[touch] press(%d, %d) slot %d", x, y, slot);
             // Ancla adaptativa: solo press cerca del joystick (dentro del
             // círculo). Los de menú en la mitad izquierda la desplazaban.
             int ax = x - MOVE_ANCHOR_X, ay = y - MOVE_ANCHOR_Y;
@@ -542,7 +581,11 @@ static void poll_input(void) {
 }
 
 int main() {
+    // Núcleo 0 exclusivo para el hilo del juego (lógica + render, el motor
+    // es de un solo hilo); el resto de hilos va a los núcleos 1-2.
+    sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF, SCE_KERNEL_CPU_MASK_USER_0);
     soloader_init_all();
+    crash_guard_init();
 
     // El motor guarda en /data/data/<pkg>/ (remapeado a saves/ en io.c) y nunca
     // hace mkdir: en Android esa carpeta ya existe. Sin esto, en una instalación
@@ -572,6 +615,32 @@ int main() {
     }
 
     gl_init();
+    port_config_load();
+    msg_active = (const char *)so_symbol(&so_mod, "_ZN13ILevelMessage16bIsMessageActiveE");
+    if (g_aspect_original && !gl_game_fbo_init(g_eng_w, g_eng_h)) {
+        g_aspect_original = 0;
+        g_eng_w = 960;
+        g_eng_h = 544;
+    }
+    move_anchor_py = MOVE_ANCHOR_Y;
+    level_get = (void *)so_symbol(&so_mod, "_ZN6CLevel8GetLevelEv");
+    vox_mgr = (void **)so_symbol(&so_mod, "_ZN15VoxSoundManager9SingletonE");
+    vox_resume_all = (void *)so_symbol(&so_mod, "_ZN15VoxSoundManager15ResumeAllSoundsEv");
+    mech_vptr = so_symbol(&so_mod, "_ZTV19CLevelInterfaceMech");
+    if (mech_vptr)
+        mech_vptr += 8;
+    // RTT de post-efectos (toda la escena cuando hay líquidos/refracción en
+    // pantalla): el motor usa k_screenSize * A/B = 3/4. 1/2 = ~44% menos
+    // píxeles en esas escenas. Tiene que ir antes de nativeInit (OnResize).
+    if (g_fx_low) {
+        int *ra = (int *)so_symbol(&so_mod, "_ZN11PostEffects16s_Scale_Raport_AE");
+        int *rb = (int *)so_symbol(&so_mod, "_ZN11PostEffects16s_Scale_Raport_BE");
+        if (ra && rb && *ra == 3 && *rb == 4) {
+            *ra = 1;
+            *rb = 2;
+        } else
+            l_error("fx: PostEffects scale not patched (%p %p)", ra, rb);
+    }
     video_init();
 
     // Mirror of GameRenderer.onSurfaceCreated (GameRenderer.java:120-144):
@@ -635,17 +704,19 @@ int main() {
     // returns); passed as the 3rd arg exactly like GameRenderer.java does.
     // Se reporta la pantalla REAL 960x544 (el 960x640 metía otra cámara y el
     // juego se veía con zoom/desbordado, log 0010). Ver glutil.h.
-    l_error("BOOT: GameRenderer.nativeInit(%d, %d, 1) [real]", ENG_W, ENG_H);
-    renderer_init(ENV, NULL, ENG_W, ENG_H, 1);
+    l_error("BOOT: GameRenderer.nativeInit(%d, %d, 1)", g_eng_w, g_eng_h);
+    renderer_init(ENV, NULL, g_eng_w, g_eng_h, 1);
     if (renderer_resize) {
         l_error("BOOT: GameRenderer.nativeResize [real]");
-        renderer_resize(ENV, NULL, ENG_W, ENG_H);
+        renderer_resize(ENV, NULL, g_eng_w, g_eng_h);
     }
 
     // GameRenderer.onSurfaceCreated: tras nativeInit, si el intro no se vio,
     // lanza MyVideoView con GLVideo.mp4 y onDrawFrame no llama nativeRender
     // hasta que termina. Mismo orden acá: bloqueante, Cross/START lo saltan.
+    gl_screen_fb(1);
     video_play("GLVideo.mp4");
+    gl_screen_fb(0);
     gl_provide_phycont();
 
     // Touch sensor is off by default -- without this sceTouchPeek reports 0.
@@ -655,13 +726,23 @@ int main() {
     // around IME but the boot default here is what the game loop sees.
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
 
-    cam_load();
-    l_error("BOOT: camera sensitivity %d/%d (SELECT + D-pad arriba/abajo)", cam_level, CAM_LEVEL_MAX);
     l_error("BOOT: entering render loop");
     while (1) {
-        if (touch_pressed && touch_moved && touch_released && key_down && key_up)
+        if (menu_active()) {
+            // Juego en pausa: sin nativeRender; solo se redibuja el menú
+            // cuando cambia algo.
+            if (menu_frame())
+                gl_swap();
+            else
+                sceKernelDelayThread(16000);
+            continue;
+        }
+        if (touch_pressed && touch_moved && touch_released && key_down && key_up &&
+            !check_menu_combo() && !wait_release)
             poll_input();
         renderer_render(ENV, NULL);
+        if (g_aspect_original)
+            gl_game_present(ORIG_X, 0, ORIG_W, VITA_H, g_filter_smooth);
         cam_osd_draw();
         gl_swap();
     }

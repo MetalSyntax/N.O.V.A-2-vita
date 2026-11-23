@@ -14,7 +14,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(VITA_APP_NAME "N.O.V.A 2")
 set(VITA_TITLEID "PSVNOVA02")
 set(VITA_VPKNAME "nova2")
-set(VITA_VERSION "01.02")
+set(VITA_VERSION "01.10")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
 # Optional: used for "send" and "dump" targets
@@ -67,11 +67,15 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
+               source/crash_guard.c
+               source/crash_guard_cxx.cpp
                source/video.cpp
                source/video_avc.c
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/port_menu.c
+               source/utils/font8x8.c
                source/generated_jni_stubs.c
                source/jni_impl.c
                source/audiotrack.c
@@ -155,6 +159,7 @@ target_include_directories(${CMAKE_PROJECT_NAME}
                            )
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
+                      -Wl,--wrap=abort
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
                       vitaGL

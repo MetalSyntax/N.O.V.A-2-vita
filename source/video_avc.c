@@ -378,7 +378,7 @@ static void audio_decode_push(AVCodecContext *ctx, AVPacket *pkt, AVFrame *fr, i
 // Dibujo: textura RGBA (escrita por el decoder) a pantalla completa 16:9
 // ---------------------------------------------------------------------------
 static GLuint g_prog;
-static GLint g_tex_loc;
+static GLint g_tex_loc, g_texel_loc;
 #define ATTR_POS 14
 #define ATTR_UV 15
 
@@ -433,10 +433,21 @@ static void ensure_prog(void) {
         "varying vec2 vUV;\n"
         "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vUV = aUV; }\n";
     static const char *fs_src =
+        // Nitidez: el video es 640x360 estirado 1.5x con bilineal (borroso).
+        // Unsharp mask de 5 lecturas en el mismo quad: sin pasada extra, el
+        // decoder/subida no cambian (log 0032: 0 frames atrasados).
         "precision mediump float;\n"
         "uniform sampler2D uTex;\n"
+        "uniform vec2 uTexel;\n"
         "varying vec2 vUV;\n"
-        "void main() { gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0); }\n";
+        "void main() {\n"
+        "  vec3 c = texture2D(uTex, vUV).rgb;\n"
+        "  vec3 b = texture2D(uTex, vUV + vec2(uTexel.x, 0.0)).rgb\n"
+        "         + texture2D(uTex, vUV - vec2(uTexel.x, 0.0)).rgb\n"
+        "         + texture2D(uTex, vUV + vec2(0.0, uTexel.y)).rgb\n"
+        "         + texture2D(uTex, vUV - vec2(0.0, uTexel.y)).rgb;\n"
+        "  gl_FragColor = vec4(clamp(c + 0.7 * (c - b * 0.25), 0.0, 1.0), 1.0);\n"
+        "}\n";
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &vs_src, NULL);
     glCompileShader(vs);
@@ -454,9 +465,10 @@ static void ensure_prog(void) {
     glDeleteShader(vs);
     glDeleteShader(fs);
     g_tex_loc = glGetUniformLocation(g_prog, "uTex");
+    g_texel_loc = glGetUniformLocation(g_prog, "uTexel");
 }
 
-static void draw_tex(GLuint tex, int vw, int vh, int th) {
+static void draw_tex(GLuint tex, int vw, int vh, int tw, int th) {
     // Letterbox a 960x544 conservando el aspecto del video.
     float sx = 1.0f, sy = 1.0f;
     float va = (float)vw / (float)vh, sa = 960.0f / 544.0f;
@@ -477,6 +489,7 @@ static void draw_tex(GLuint tex, int vw, int vh, int th) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     glUniform1i(g_tex_loc, 0);
+    glUniform2f(g_texel_loc, 1.0f / (float)tw, 1.0f / (float)th);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glEnableVertexAttribArray(ATTR_POS);
     glEnableVertexAttribArray(ATTR_UV);
@@ -640,7 +653,8 @@ int video_play_avc(const char *path) {
         } else {
             g_ring_w = g_ring_r = 0;
             g_audio_quit = 0;
-            athread = sceKernelCreateThread("intro_audio", audio_thread, 0x10000100 - 10, 0x4000, 0, 0, NULL);
+            athread = sceKernelCreateThread("intro_audio", audio_thread, 0x10000100 - 10, 0x4000, 0,
+                                            SCE_KERNEL_CPU_MASK_USER_2, NULL);
             if (athread >= 0)
                 sceKernelStartThread(athread, 0, NULL);
         }
@@ -740,7 +754,7 @@ int video_play_avc(const char *path) {
         }
         if (ahead > 2000)
             sceKernelDelayThread((SceUInt)(ahead - 1000));
-        draw_tex(tex[cur], v.width, v.height, ah);
+        draw_tex(tex[cur], v.width, v.height, aw, ah);
         cur = (cur + 1) % N_TEX;
         if (++drawn == 1)
             l_success("video_avc: primer frame en pantalla");

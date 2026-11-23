@@ -30,6 +30,15 @@ void gl_provide_phycont();
 
 void gl_swap();
 
+// Aspecto ORIGINAL: el "FBO 0" del motor pasa a un FBO w x h propio.
+int gl_game_fbo_init(int w, int h);
+// Escala ese frame a pantalla en (x,y,w,h); smooth = GL_LINEAR.
+void gl_game_present(int x, int y, int w, int h, int smooth);
+// 1 = pantalla real enlazada (videos), 0 = volver a lo del motor.
+void gl_screen_fb(int on);
+void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoff, GLint yoff,
+                                  GLint x, GLint y, GLsizei w, GLsizei h);
+
 void glCompileShader_soloader(GLuint shader);
 
 void glLinkProgram_soloader(GLuint program);

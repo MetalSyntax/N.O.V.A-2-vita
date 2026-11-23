@@ -109,8 +109,15 @@ jint impl_AudioTrack_write(jmethodID id, va_list args) {
     int grain_bytes = AT_GRAIN * at.frame_bytes;
     int left = size;
 
-    if (at.written == 0)
+    if (at.written == 0) {
+        // Hilo mezclador de Vox: prioridad 0x40 (la más alta de usuario) en
+        // el núcleo 2, igual que el mezclador de Asphalt-5-Vita. Así ningún
+        // hilo del motor en 1|2 lo atrasa (underrun = cortes con ráfagas de
+        // disparos). Bloquea en sceAudioOutOutput: no le roba CPU al juego.
+        sceKernelChangeThreadPriority(SCE_KERNEL_THREAD_ID_SELF, 0x40);
+        sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF, SCE_KERNEL_CPU_MASK_USER_2);
         l_success("[audiotrack] first write(%d bytes) -- Vox output path is alive", size);
+    }
 
     while (left > 0) {
         if (at.pending_len == 0 && left >= grain_bytes) {

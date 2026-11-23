@@ -8,6 +8,7 @@
  */
 
 #include "reimpl/sys.h"
+#include "crash_guard.h"
 
 #include <sys/errno.h>
 #include <psp2/kernel/threadmgr.h>
@@ -103,11 +104,13 @@ void syscall(int c) {
 
 void __stack_chk_fail_soloader() {
     l_fatal("Stack collapsed at address %p", __builtin_return_address(0));
+    crash_fatal("Stack corruption detected (stack protector)", NULL, 0,
+                (uint32_t)__builtin_return_address(0), NULL, 0);
 }
 
 void abort_soloader() {
     l_fatal("Abort called from address %p", __builtin_return_address(0));
-    abort();
+    crash_fatal("The game called abort()", NULL, 0, (uint32_t)__builtin_return_address(0), NULL, 0);
 }
 
 void exit_soloader(int status) {

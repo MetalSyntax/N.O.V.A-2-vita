@@ -3,6 +3,7 @@
 #include <falso_jni/FalsoJNI_Logger.h>
 #include "generated_jni_table.h"
 #include "video.h"
+#include "utils/glutil.h"
 #include "utils/logger.h"
 #include <psp2/kernel/processmgr.h>
 
@@ -326,8 +327,11 @@ void stub_GLMediaPlayer_loadBackground_58(jmethodID id, va_list args) {
 void stub_GLMediaPlayer_loadMovie_59(jmethodID id, va_list args) {
     const char *name = (const char *) va_arg(args, jobject);
     l_error("[Java] GLMediaPlayer.loadMovie(%s)", name ? name : "(null)");
-    if (name)
+    if (name) {
+        gl_screen_fb(1); // aspecto ORIGINAL: el video va a la pantalla real
         video_play(name);
+        gl_screen_fb(0);
+    }
 }
 
 void stub_GLMediaPlayer_loadMusic_60(jmethodID id, va_list args) {

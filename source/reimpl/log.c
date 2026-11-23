@@ -9,6 +9,7 @@
  */
 
 #include "reimpl/log.h"
+#include "crash_guard.h"
 #include "utils/logger.h"
 #include <psp2/kernel/clib.h>
 #include <stdlib.h>
@@ -89,22 +90,18 @@ int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap)
 }
 
 void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...) {
+    static char text[512];
+
     if (fmt) {
         va_list list;
-        char text[1024];
-
         va_start(list, fmt);
         sceClibVsnprintf(text, sizeof(text), fmt, list);
         va_end(list);
-
-        l_fatal("[ALOG][ASSERT] %s", text);
     } else {
-        if (cond) {
-            l_fatal("[ALOG][ASSERT] Assertion failed: %s", cond);
-        } else {
-            l_fatal("[ALOG][ASSERT] Unspecified assertion failed");
-        }
+        sceClibSnprintf(text, sizeof(text), "Assertion failed: %s",
+                        cond ? cond : "(unspecified)");
     }
-
-    abort();
+    l_fatal("[ALOG][ASSERT] %s", text);
+    crash_fatal("Engine assertion failed", text, 0,
+                (uint32_t)__builtin_return_address(0), NULL, 0);
 }

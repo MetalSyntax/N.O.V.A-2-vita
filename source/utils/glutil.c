@@ -8,6 +8,7 @@
  */
 
 #include "utils/glutil.h"
+#include "crash_guard.h"
 
 #include "utils/utils.h"
 #include "utils/dialog.h"
@@ -18,6 +19,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/io/stat.h>
 
 // Helpers for our handling of shaders
@@ -66,6 +68,8 @@ void gl_init() {
     initialized = 1;
 
     vglSetupRenderTargetScenesNum(8, 8);
+    // Recolector de vitaGL fuera del núcleo del juego (default: hereda el 0).
+    vglSetupGarbageCollector(0x10000100, SCE_KERNEL_CPU_MASK_USER_1);
     sceIoMkdir(DATA_PATH "shader_cache", 0777);
     vglSetShaderCachePath(DATA_PATH "shader_cache");
     vglUseCachedMem(GL_TRUE);
@@ -100,6 +104,7 @@ void gl_provide_phycont() {
 }
 
 void gl_swap() {
+    crash_guard_poll();
     vglSwapBuffers(GL_FALSE);
 }
 
@@ -199,9 +204,150 @@ void glLinkProgram_soloader(GLuint program) {
 // scissor aquí rompía el juego 3D. Solo se rastrea el FBO para el log.
 static GLuint s_bound_fbo = 0;
 
+// Aspecto ORIGINAL (menú SELECT+START): el motor renderiza a 800x480 en
+// s_game_fbo (el "FBO 0" del motor se redirige ahí) y gl_game_present lo
+// escala a pantalla. Cuesta FPS: escena extra + un quad de pantalla completa.
+static GLuint s_game_fbo, s_game_tex, s_game_rb, s_blit_prog;
+
 void glBindFramebuffer_soloader(GLenum target, GLuint framebuffer) {
     s_bound_fbo = framebuffer;
-    glBindFramebuffer(target, framebuffer);
+    glBindFramebuffer(target, framebuffer ? framebuffer : s_game_fbo);
+}
+
+// Diagnóstico (caída de FPS con líquidos, 2026-11-22): glitch emula RTT con
+// glCopyTexSubImage2D si el driver no tiene FBO (CRenderTarget::unbind); en
+// vitaGL eso cierra la escena GXM. Se loguean solo las primeras llamadas.
+void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoff, GLint yoff,
+                                  GLint x, GLint y, GLsizei w, GLsizei h) {
+    static int n;
+    if (n < 4)
+        l_error("[glcopy] #%d CopyTexSubImage2D %dx%d FBO%u", ++n, w, h, s_bound_fbo);
+    glCopyTexSubImage2D(target, level, xoff, yoff, x, y, w, h);
+}
+
+void gl_screen_fb(int on) {
+    glBindFramebuffer(GL_FRAMEBUFFER, on ? 0 : (s_bound_fbo ? s_bound_fbo : s_game_fbo));
+}
+
+int gl_game_fbo_init(int w, int h) {
+    GLint tex;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    glGenTextures(1, &s_game_tex);
+    glBindTexture(GL_TEXTURE_2D, s_game_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGenRenderbuffers(1, &s_game_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, s_game_rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+    glGenFramebuffers(1, &s_game_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, s_game_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_game_tex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s_game_rb);
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        l_error("game FBO %dx%d incomplete (0x%x): back to direct rendering", w, h, st);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_bound_fbo);
+        glDeleteFramebuffers(1, &s_game_fbo);
+        s_game_fbo = 0;
+        return 0;
+    }
+    // Si el motor tenía un RT propio enlazado, se respeta.
+    if (s_bound_fbo)
+        glBindFramebuffer(GL_FRAMEBUFFER, s_bound_fbo);
+
+    static const char *vs =
+        "attribute vec2 aPos;\n"
+        "attribute vec2 aUV;\n"
+        "varying vec2 vUV;\n"
+        "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vUV = aUV; }\n";
+    static const char *fs =
+        "precision mediump float;\n"
+        "varying vec2 vUV;\n"
+        "uniform sampler2D uTex;\n"
+        "void main() { gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0); }\n";
+    GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(v, 1, &vs, NULL);
+    glCompileShader_soloader(v);
+    glShaderSource(f, 1, &fs, NULL);
+    glCompileShader_soloader(f);
+    s_blit_prog = glCreateProgram();
+    glAttachShader(s_blit_prog, v);
+    glAttachShader(s_blit_prog, f);
+    glBindAttribLocation(s_blit_prog, 0, "aPos");
+    glBindAttribLocation(s_blit_prog, 1, "aUV");
+    glLinkProgram_soloader(s_blit_prog);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    l_info("game FBO %dx%d ready", w, h);
+    return 1;
+}
+
+// Copia el frame del motor a la pantalla en (x,y,w,h) (origen arriba-izq.),
+// bordes negros. Guarda/restaura todo el estado GL que toca: el motor
+// (glitch) cachea el suyo y no lo vuelve a fijar.
+void gl_game_present(int x, int y, int w, int h, int smooth) {
+    if (!s_game_fbo)
+        return;
+    GLint prog, active, tex, abuf, vp[4], en[2];
+    GLboolean blend = glIsEnabled(GL_BLEND), depth = glIsEnabled(GL_DEPTH_TEST),
+              sc = glIsEnabled(GL_SCISSOR_TEST), cull = glIsEnabled(GL_CULL_FACE),
+              sten = glIsEnabled(GL_STENCIL_TEST);
+    GLfloat cc[4];
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+    for (int i = 0; i < 2; i++)
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en[i]);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+    glViewport(0, 0, 960, 544);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    float x0 = x / 480.0f - 1.0f, x1 = (x + w) / 480.0f - 1.0f;
+    float y0 = 1.0f - y / 272.0f, y1 = 1.0f - (y + h) / 272.0f;
+    // Textura de FBO: la fila 0 es la de abajo -> v=1 arriba.
+    const GLfloat pos[8] = { x0, y0, x1, y0, x0, y1, x1, y1 };
+    const GLfloat uv[8] = { 0, 1, 1, 1, 0, 0, 1, 0 };
+    glUseProgram(s_blit_prog);
+    glBindTexture(GL_TEXTURE_2D, s_game_tex);
+    GLint filt = smooth ? GL_LINEAR : GL_NEAREST;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
+    glUniform1i(glGetUniformLocation(s_blit_prog, "uTex"), 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, pos);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    for (int i = 0; i < 2; i++)
+        if (!en[i])
+            glDisableVertexAttribArray(i);
+    glBindBuffer(GL_ARRAY_BUFFER, abuf);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glActiveTexture(active);
+    glUseProgram(prog);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glClearColor(cc[0], cc[1], cc[2], cc[3]);
+    if (blend) glEnable(GL_BLEND);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    if (sc) glEnable(GL_SCISSOR_TEST);
+    if (cull) glEnable(GL_CULL_FACE);
+    if (sten) glEnable(GL_STENCIL_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, s_bound_fbo ? s_bound_fbo : s_game_fbo);
 }
 
 void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {

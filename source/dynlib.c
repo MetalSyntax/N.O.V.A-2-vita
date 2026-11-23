@@ -668,7 +668,7 @@ so_default_dynlib default_dynlib[] = {
         { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_soloader },
         { "glCompressedTexSubImage2D", (uintptr_t)&glCompressedTexSubImage2D_stub },
         { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D },
-        { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D },
+        { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D_soloader },
         { "glCreateProgram", (uintptr_t)&glCreateProgram },
         { "glCreateShader", (uintptr_t)&glCreateShader },
         { "glCullFace", (uintptr_t)&glCullFace },

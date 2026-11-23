@@ -17,6 +17,7 @@
 #include <kubridge.h>
 #include <so_util/so_util.h>
 
+#include "port_menu.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
 
@@ -150,8 +151,9 @@ static void patch_swp(void) {
 #define DRAW2DRECT_OFF      0x5a5a14
 static const uint32_t d2d_sites[] = { 0x272df8, 0x272e2c };
 
-#define BG_SCREEN_W 960
-#define BG_SCREEN_H 544
+// Tamaño del motor (960x544, o 800x480 con aspecto ORIGINAL: escala ~1).
+#define BG_SCREEN_W g_eng_w
+#define BG_SCREEN_H g_eng_h
 
 typedef struct { int x1, y1, x2, y2; } rect_i;
 
@@ -279,12 +281,18 @@ static void patch_bg_stretch(void) {
  * atenúa la instancia con frame 0xa5 (+0x58). El HUD 3D (pausa, arma,
  * granada) muestra munición/cantidades y queda intacto.
  */
+/*
+ * 2026-11-22 (log 0032, "aparecen al apretar botones"): ahora alfa 0 real
+ * (el alfa va directo al byte A del SColor: 0 = invisible) y conmutable en el
+ * menú SELECT+START (g_touch_hidden). Faltaba el CButtonSpr del poder
+ * especial (+0x3c de CLevelInterfaceNormal, frames 0xa9/0xac, mismo lugar que
+ * el rayo): CLevelInterfaceNormal::Draw lo pinta con el alfa de cinemática,
+ * sin pasar por los ControlScheme, y aparecía al usar L.
+ */
 typedef void (*draw_fn)(void *self, int alpha);
-
-static inline int dim_alpha(int a) {
-    int d = (a + 50) / 100;
-    return (a > 0 && d == 0) ? 1 : d;
-}
+// Log 0033 / captura del mecha: con alfa 0 los controles se veían enteros (el
+// material 2D no usa el alfa de vértice en todos los casos). Ocultos = no se
+// llama al Draw (estos Draw solo pintan; la lógica está en Update/touch).
 
 // Busca `fn` en los primeros slots de la vtable `vt` y lo cambia por `hook`.
 static draw_fn vt_swap(const char *vt_sym, const char *fn_sym, draw_fn hook) {
@@ -312,20 +320,72 @@ static draw_fn vt_swap(const char *vt_sym, const char *fn_sym, draw_fn hook) {
 
 #define DIM_DECL(n, m) \
     static draw_fn scheme##n##_draw; \
-    static void scheme##n##_hook(void *self, int a) { scheme##n##_draw(self, dim_alpha(a)); }
+    static void scheme##n##_hook(void *self, int a) { if (!g_touch_hidden) scheme##n##_draw(self, a); }
 DIM_SCHEMES(DIM_DECL)
 
 static draw_fn sweep_draw;
 static void sweep_hook(void *self, int a) {
-    if (*(int *)((uint8_t *)self + 0x58) == 0xa5)
-        a = dim_alpha(a);
+    if (g_touch_hidden && *(int *)((uint8_t *)self + 0x58) == 0xa5)
+        return;
     sweep_draw(self, a);
+}
+
+static draw_fn spr_draw;
+static void spr_hook(void *self, int a) {
+    if (g_touch_hidden && *(int *)((uint8_t *)self + 0x54) == 0xa9)
+        return;
+    spr_draw(self, a);
 }
 
 static void patch_dim_controls(void) {
 #define DIM_APPLY(n, m) scheme##n##_draw = vt_swap("_ZTV" m, "_ZN" m "4DrawEi", scheme##n##_hook);
     DIM_SCHEMES(DIM_APPLY)
     sweep_draw = vt_swap("_ZTV12CButtonSweep", "_ZN12CButtonSweep4DrawEi", sweep_hook);
+    spr_draw = vt_swap("_ZTV10CButtonSpr", "_ZN10CButtonSpr4DrawEi", spr_hook);
+}
+
+// CWeaponComponent::FireStartSound: solo lanza el bucle de disparo si el handle
+// guardado (this+0x120, 64 bits) es -1, y solo FireStopSound lo resetea. Vox a
+// veces crea ese emisor en pausa (o lo pierde): el handle sigue válido, el
+// disparo queda mudo y solo volvía con pausa/despausa (ResumeAllSounds).
+// Mismo código que el original + descarta handles que no suenan + Resume.
+typedef long long (*vox_play_fn)(void *mgr, void *snd, int loop, int a, int b, int c);
+typedef int (*vox_isplaying_h_fn)(void *mgr, void *snd, long long h);
+typedef float (*vox_resume_h_fn)(void *mgr, void *snd, long long h, float fade);
+typedef void (*vox_stop_h_fn)(void *mgr, void *snd, long long h, int fade_ms);
+static void **vox_singleton;
+static vox_play_fn vox_play;
+static vox_isplaying_h_fn vox_isplaying_h;
+static vox_resume_h_fn vox_resume_h;
+static vox_stop_h_fn vox_stop_h;
+
+static void fire_start_sound_hook(char *self, int idx) {
+    void *snd = (*(void ***)(self + 0x108))[idx];
+    long long *h = (long long *)(self + 0x120);
+    void *mgr = *vox_singleton;
+    if (!snd || !mgr)
+        return;
+    if (*h != -1 && !vox_isplaying_h(mgr, snd, *h)) {
+        vox_stop_h(mgr, snd, *h, 0);
+        *h = -1;
+    }
+    if (*h == -1)
+        *h = vox_play(mgr, snd, 1, 0, 1, 0); // args de la llamada original
+    if (*h != -1)
+        vox_resume_h(mgr, snd, *h, 0.0f);
+}
+
+static void patch_fire_sound(void) {
+    vox_singleton = (void **)so_symbol(&so_mod, "_ZN15VoxSoundManager9SingletonE");
+    vox_play = (vox_play_fn)so_symbol(&so_mod, "_ZN15VoxSoundManager4PlayEPvbiib");
+    vox_isplaying_h = (vox_isplaying_h_fn)so_symbol(&so_mod, "_ZN15VoxSoundManager19IsPlayingByHandleIdEPvx");
+    vox_resume_h = (vox_resume_h_fn)so_symbol(&so_mod, "_ZN15VoxSoundManager16ResumeByHandleIdEPvxf");
+    vox_stop_h = (vox_stop_h_fn)so_symbol(&so_mod, "_ZN15VoxSoundManager14StopByHandleIdEPvxi");
+    if (!vox_singleton || !vox_play || !vox_isplaying_h || !vox_resume_h || !vox_stop_h) {
+        l_error("patch_fire_sound: Vox symbols missing, skipped");
+        return;
+    }
+    hook_sym("_ZN16CWeaponComponent14FireStartSoundEi", (void *)fire_start_sound_hook);
 }
 
 void so_patch(void) {
@@ -333,4 +393,5 @@ void so_patch(void) {
     patch_swp();
     patch_bg_stretch();
     patch_dim_controls();
+    patch_fire_sound();
 }

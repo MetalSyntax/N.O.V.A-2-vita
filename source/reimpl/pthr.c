@@ -19,8 +19,6 @@
 #include "utils/utils.h"
 #include "utils/logger.h"
 
-#define PTHR_MAX_OBJECTS 1024
-
 #define BIONIC_PTHREAD_COND_INITIALIZER              0
 #define BIONIC_PTHREAD_MUTEX_INITIALIZER             0
 #define BIONIC_PTHREAD_RECURSIVE_MUTEX_INITIALIZER   0x4000
@@ -39,64 +37,6 @@ enum {
 
 #define PTHR_INLINE static inline __attribute__((always_inline))
 
-void * initializedObjects[PTHR_MAX_OBJECTS] = {0};
-static SceKernelLwMutexWork pthr_mutex;
-static volatile short int pthr_mutex_inited = 0;
-
-#define PTHR_LOCK \
-    if (!pthr_mutex_inited) { \
-        int ret = sceKernelCreateLwMutex(&pthr_mutex, "log_lock", 0, 0, NULL); \
-        if (ret < 0) { \
-            sceClibPrintf("Error: failed to create pthr mutex: 0x%x\n", ret); \
-            return 0; \
-        } \
-        pthr_mutex_inited = 1; \
-    } \
-    sceKernelLockLwMutex(&pthr_mutex, 1, NULL);
-
-#define PTHR_UNLOCK \
-    if (pthr_mutex_inited) { \
-        sceKernelUnlockLwMutex(&pthr_mutex, 1); \
-    }
-
-int isObjectInitialized(const void * mut) {
-    PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == mut) {
-            PTHR_UNLOCK
-            return 1;
-        }
-    }
-    PTHR_UNLOCK
-    return 0;
-}
-
-int rememberObject(void * mut) {
-    PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == 0) {
-            initializedObjects[i] = mut;
-            PTHR_UNLOCK
-            return 1;
-        }
-    }
-    PTHR_UNLOCK
-    return 0;
-}
-
-int forgetObject(const void * mut) {
-    PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == mut) {
-            initializedObjects[i] = 0;
-            PTHR_UNLOCK
-            return 1;
-        }
-    }
-    PTHR_UNLOCK
-    return 0;
-}
-
 // null check for `attr` must be performed before this
 PTHR_INLINE int _attr_t_static_init(pthread_attr_t_bionic * attr) {
     if (attr->magic != 0x42424242) {
@@ -107,68 +47,76 @@ PTHR_INLINE int _attr_t_static_init(pthread_attr_t_bionic * attr) {
     return 0;
 }
 
-// null check for `mutex` param must be performed before this, `attr` is fine as null
-PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthread_mutexattr_t * attr) {
-    int ret = 0, kind = PTHREAD_MUTEX_NORMAL;
+// Valor sin inicializar = uno de los PTHREAD_*_INITIALIZER estáticos de bionic.
+#define PTHR_IS_STATIC(p) ((uintptr_t)(p) == 0 || (uintptr_t)(p) == BIONIC_PTHREAD_RECURSIVE_MUTEX_INITIALIZER || \
+                           (uintptr_t)(p) == BIONIC_PTHREAD_ERRORCHECK_MUTEX_INITIALIZER)
 
-    if (isObjectInitialized(mutex)) {
-        //logv_debug("mutex already initialized: %p", mutex);
-        return ret;
-    }
-
-    if (attr) {
-        pthread_mutexattr_gettype((pthread_mutexattr_t *) attr, &kind);
-    } else {
-        if (* (int *) mutex == BIONIC_PTHREAD_MUTEX_INITIALIZER) kind = PTHREAD_MUTEX_NORMAL;
-        else if (* (int *) mutex == BIONIC_PTHREAD_RECURSIVE_MUTEX_INITIALIZER) kind = PTHREAD_MUTEX_RECURSIVE;
-        else if (* (int *) mutex == BIONIC_PTHREAD_ERRORCHECK_MUTEX_INITIALIZER) kind = PTHREAD_MUTEX_ERRORCHECK;
-    }
-
-    pthread_mutex_t mut;
-    mutex->real_ptr = malloc(sizeof(pthread_mutex_t));
-    sceClibMemcpy(mutex->real_ptr, &mut, sizeof(pthread_mutex_t));
-
+static pthread_mutex_t *_mutex_new(int kind) {
+    pthread_mutex_t *m = malloc(sizeof(*m));
+    if (!m) return NULL;
     pthread_mutexattr_t mutattr;
     pthread_mutexattr_init(&mutattr);
     pthread_mutexattr_settype(&mutattr, kind);
-    ret = pthread_mutex_init(mutex->real_ptr, &mutattr);
+    if (pthread_mutex_init(m, &mutattr) != 0) { free(m); m = NULL; }
     pthread_mutexattr_destroy(&mutattr);
-
-    if (ret == 0) {
-        rememberObject(mutex);
-    } else {
-        l_error("mutex initialization for %p has failed", mutex);
-    }
-
-    return ret;
+    return m;
 }
 
-// null check for `cond` param must be performed before this, `attr` is fine as null
-PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_condattr_t * attr) {
-    int ret = 0;
-
-    if (isObjectInitialized(cond)) {
-        //logv_debug("cond already initialized: %p", cond);
-        return ret;
+// Init perezoso de mutex estáticos (bionic permite usarlos sin pthread_mutex_init).
+// CAS: con hilos en núcleos distintos (2026-11-23), dos primeros lock simultáneos
+// creaban dos mutex distintos -> sin exclusión -> lista de Vox corrupta -> doble free.
+PTHR_INLINE pthread_mutex_t *_mutex_get(pthread_mutex_t_bionic *mutex) {
+    pthread_mutex_t *cur = mutex->real_ptr;
+    if (!PTHR_IS_STATIC(cur)) return cur;
+    int kind = (uintptr_t)cur == BIONIC_PTHREAD_RECURSIVE_MUTEX_INITIALIZER ? PTHREAD_MUTEX_RECURSIVE
+             : (uintptr_t)cur == BIONIC_PTHREAD_ERRORCHECK_MUTEX_INITIALIZER ? PTHREAD_MUTEX_ERRORCHECK
+             : PTHREAD_MUTEX_NORMAL;
+    pthread_mutex_t *m = _mutex_new(kind);
+    if (!m) return NULL;
+    if (!__sync_bool_compare_and_swap(&mutex->real_ptr, cur, m)) {
+        pthread_mutex_destroy(m); // otro hilo ganó la carrera
+        free(m);
     }
+    return mutex->real_ptr;
+}
 
-    pthread_cond_t c;
-    cond->real_ptr = malloc(sizeof(pthread_cond_t));
-    sceClibMemcpy(cond->real_ptr, &c, sizeof(pthread_cond_t));
-
-    ret = pthread_cond_init(cond->real_ptr, attr);
-
-    if (ret == 0) {
-        rememberObject(cond);
-    } else {
-        l_error("cond initialization for %p has failed", cond);
+PTHR_INLINE pthread_cond_t *_cond_get(pthread_cond_t_bionic *cond) {
+    pthread_cond_t *cur = cond->real_ptr;
+    if (cur) return cur;
+    pthread_cond_t *c = malloc(sizeof(*c));
+    if (!c) return NULL;
+    if (pthread_cond_init(c, NULL) != 0) { free(c); return NULL; }
+    if (!__sync_bool_compare_and_swap(&cond->real_ptr, NULL, c)) {
+        pthread_cond_destroy(c);
+        free(c);
     }
+    return cond->real_ptr;
+}
 
-    return ret;
+// Reparto de núcleos (2026-11-22): sin máscara, un hilo nuevo hereda el
+// núcleo de su creador -> los hilos del motor (Vox, carga, streaming, red)
+// competían con el hilo del juego en el núcleo 0. Núcleo 0 = solo el juego
+// (main.c); los del motor van a 1-2 (el audio de Vox se fija al 2 en
+// audiotrack.c).
+typedef struct { void *(*start)(void *); void *param; } thr_tramp;
+
+static void *thr_entry(void *p) {
+    thr_tramp t = *(thr_tramp *)p;
+    free(p);
+    sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF,
+                                         SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
+    return t.start(t.param);
 }
 
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr, void *(*start)(void *), void *param) {
     int ret;
+    thr_tramp *t = malloc(sizeof(*t));
+    if (t) {
+        t->start = start;
+        t->param = param;
+        start = thr_entry;
+        param = t;
+    }
 
     if (!attr) {
         pthread_attr_t a;
@@ -181,6 +129,8 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
         pthread_attr_setstacksize(attr->real_ptr, 512 * 1024);
         ret = pthread_create(thread, attr->real_ptr, start, param);
     }
+    if (ret != 0 && t)
+        free(t);
 
     return ret;
 }
@@ -208,15 +158,18 @@ int pthread_kill_soloader(pthread_t thread, int sig)
 int pthread_mutex_init_soloader(pthread_mutex_t_bionic *uid, const pthread_mutexattr_t *attr)
 {
     if (!uid) return EINVAL;
-    return _mutex_t_static_init(uid, attr);
+    int kind = PTHREAD_MUTEX_NORMAL;
+    if (attr) pthread_mutexattr_gettype((pthread_mutexattr_t *) attr, &kind);
+    // Siempre uno nuevo: la memoria puede venir de malloc con basura.
+    uid->real_ptr = _mutex_new(kind);
+    return uid->real_ptr ? 0 : ENOMEM;
 }
 
 int pthread_mutex_destroy_soloader(pthread_mutex_t_bionic *mutex)
 {
-    if (!mutex) return 0;
-    forgetObject(mutex);
+    if (!mutex || PTHR_IS_STATIC(mutex->real_ptr)) return 0;
     int ret = pthread_mutex_destroy(mutex->real_ptr);
-    if (mutex->real_ptr) free(mutex->real_ptr);
+    free(mutex->real_ptr);
     mutex->real_ptr = 0x0;
     return ret;
 }
@@ -224,21 +177,21 @@ int pthread_mutex_destroy_soloader(pthread_mutex_t_bionic *mutex)
 int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
-    _mutex_t_static_init(mutex, NULL);
-    return pthread_mutex_lock(mutex->real_ptr);
+    pthread_mutex_t *m = _mutex_get(mutex);
+    return m ? pthread_mutex_lock(m) : ENOMEM;
 }
 
 int pthread_mutex_trylock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
-    _mutex_t_static_init(mutex, NULL);
-    return pthread_mutex_trylock(mutex->real_ptr);
+    pthread_mutex_t *m = _mutex_get(mutex);
+    return m ? pthread_mutex_trylock(m) : ENOMEM;
 }
 
 int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
-    if (!mutex->real_ptr) return EINVAL;
+    if (PTHR_IS_STATIC(mutex->real_ptr)) return EINVAL;
     return pthread_mutex_unlock(mutex->real_ptr);
 }
 
@@ -264,15 +217,19 @@ int pthread_cond_init_soloader(pthread_cond_t_bionic *cond,
 {
     if (!cond) return EINVAL;
 
-    return _cond_t_static_init(cond, attr);
+    pthread_cond_t *c = malloc(sizeof(*c));
+    if (!c) return ENOMEM;
+    int ret = pthread_cond_init(c, attr);
+    if (ret != 0) { free(c); c = NULL; }
+    cond->real_ptr = c;
+    return ret;
 }
 
 int pthread_cond_destroy_soloader(pthread_cond_t_bionic *cond)
 {
-    if (!cond) return 0;
-    forgetObject(cond);
+    if (!cond || !cond->real_ptr) return 0;
     int ret = pthread_cond_destroy(cond->real_ptr);
-    if (cond->real_ptr) free(cond->real_ptr);
+    free(cond->real_ptr);
     cond->real_ptr = 0x0;
     return ret;
 }
@@ -281,19 +238,17 @@ int pthread_cond_signal_soloader(pthread_cond_t_bionic *cond)
 {
     if (!cond) return EINVAL;
 
-    _cond_t_static_init(cond, NULL);
-
-    return pthread_cond_signal(cond->real_ptr);
+    pthread_cond_t *c = _cond_get(cond);
+    return c ? pthread_cond_signal(c) : ENOMEM;
 }
 
 int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bionic *mutex, struct timespec *abstime)
 {
     if (!cond || !mutex) return EINVAL;
 
-    _cond_t_static_init(cond, NULL);
-    _mutex_t_static_init(mutex, NULL);
-
-    return pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
+    pthread_cond_t *c = _cond_get(cond);
+    pthread_mutex_t *m = _mutex_get(mutex);
+    return c && m ? pthread_cond_timedwait(c, m, abstime) : ENOMEM;
 }
 
 
@@ -301,19 +256,17 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
 {
     if (!cond || !mutex) return EINVAL;
 
-    _cond_t_static_init(cond, NULL);
-    _mutex_t_static_init(mutex, NULL);
-
-    return pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
+    pthread_cond_t *c = _cond_get(cond);
+    pthread_mutex_t *m = _mutex_get(mutex);
+    return c && m ? pthread_cond_wait(c, m) : ENOMEM;
 }
 
 int pthread_cond_broadcast_soloader(pthread_cond_t_bionic *cond)
 {
     if (!cond) return EINVAL;
 
-    _cond_t_static_init(cond, NULL);
-
-    return pthread_cond_broadcast(cond->real_ptr);
+    pthread_cond_t *c = _cond_get(cond);
+    return c ? pthread_cond_broadcast(c) : ENOMEM;
 }
 
 int pthread_attr_init_soloader(pthread_attr_t_bionic *attr)

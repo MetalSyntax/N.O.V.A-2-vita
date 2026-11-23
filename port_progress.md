@@ -474,3 +474,138 @@
 - Salir del menú principal colgaba el juego: nativeExit -> GLGame.Exit() era
   un stub vacío. Ahora `sceKernelExitProcess(0)` (Android: killProcess).
 - main.c: faltaba `#include <psp2/io/stat.h>` para sceIoMkdir (Fase 22).
+
+## Fase 24: menú SELECT+START, Interactuar, controles al 0% (2026-11-22, build OK, sin probar en consola)
+- Log 0032: el toque real en (318,405) disparó `sfx_switch_activate`. Ese es el
+  botón HUD "Interactuar" (CButtonSpr de CLevelInterfaceNormal+0x28 en
+  (W/2-204, H/2+100), sube 80 px con mensaje en pantalla, según
+  `ILevelMessage::bIsMessageActive`). Ningún botón físico lo tocaba:
+  R = disparo, L = poder. Nueva acción "Interact", por defecto D-pad arriba
+  (Triángulo sigue siendo "arma siguiente"). Los nodos 3D interactivos
+  (CInteractiveComponent::ProcessScreenTouch, ray-pick) siguen siendo táctiles.
+- Controles "aparecían al apretar": el CButtonSpr del poder especial (+0x3c,
+  frames 0xa9/0xac) se pinta en CLevelInterfaceNormal::Draw con alfa de
+  cinemática, fuera de los ControlScheme. patch.c: hook a CButtonSpr::Draw
+  (frame 0xa9) y alfa 0 real (antes 1%) conmutable.
+- Nuevo `port_menu.c` (SELECT+START, estilo Zenonia 2 / Inotia 4): remapeo
+  de 11 acciones (X reemplaza, [] agrega, /\ borra), controles táctiles
+  ocultos/visibles, sensibilidad de cámara, V-Sync on/off, restaurar, salir.
+  Pausa = no se llama nativeRender. Dibujo con glScissor+glClear (sin
+  shaders). Config en `ux0:data/nova2/config.txt` (migra camera_sens.txt).
+- Rendimiento: fuera los l_error por evento de input (~400 líneas/sesión en
+  0032, cada una un sceIoWrite síncrono). Los clocks ya estaban al máximo
+  (init.c 444/222/222/166). V-Sync OFF evita que ~25 FPS se cuantice a 20.
+- Aspecto + filtro (pedido explícito, "aunque baje FPS"): "Aspect ratio"
+  FULL SCREEN (960x544 directo, sin costo) / ORIGINAL 5:3. ORIGINAL = el
+  motor arranca a 800x480 (resolución HD de Android) dentro de un FBO propio
+  (glBindFramebuffer_soloader redirige su FBO 0) y `gl_game_present` lo
+  escala a 906x544 en x=27 con bordes negros; "Scaling filter" SMOOTH/SHARP =
+  GL_LINEAR/GL_NEAREST de ese escalado. Cambiar el aspecto requiere
+  reiniciar (nativeInit fija el tamaño). Coords sintéticas reancladas
+  (RX/BY/CX/CY en main.c), táctil físico mapeado a 800x480, fondos 800x480
+  a escala 1. Videos con `gl_screen_fb(1)` (pantalla real).
+- Intro más nítido: `video_avc.c` estira 640x360 -> 960x540 con bilineal.
+  El fragment shader del quad ahora hace unsharp mask (centro + 4 vecinos a
+  1 texel, fuerza 0.7). Mismo decoder, misma subida, mismo único draw.
+
+## Fase 25: cohetes del mecha, controles ocultos de verdad, líquidos, sonido (2026-11-22, build OK, sin consola)
+- Log 0033 = build de la Fase 24 compilado SIN DEBUG_SOLOADER (cmake
+  reconfigurado sin Debug): no salen l_info/l_success ni ALOG; l_error sí.
+- Captura gd 2026-11-22-220043 (mecha): controles visibles con "HIDDEN".
+  Con alfa 0 el 2D de glitch no siempre aplica el alfa de vértice -> ahora,
+  ocultos = no se llama a Draw (ControlScheme*, rayo 0xa5, poder 0xa9).
+- Cohetes: 2º CButtonShoot (tipo 0x1d, 90x90) de cada ControlScheme en
+  (W-105, H-225). Acción "Rockets (mech)" (default L): hold en slot 7 solo si
+  CLevel::m_instance+0x6c tiene vptr de CLevelInterfaceMech; en el mecha L
+  ya no toca el rayo.
+- Líquidos 60 -> 29: con refracción en pantalla, CNovaSceneManager activa
+  PostEffects (toda la escena a un RTT de k_screenSize*3/4) + copia +
+  refracción; con V-Sync, pasar de 16.7 ms cae a 30. Opción "Water/FX
+  resolution" 1/2 (default) parchea PostEffects::s_Scale_Raport_A/B 3/4 -> 1/2
+  antes de nativeInit. Diagnóstico `[glcopy]` en el log si glitch usa
+  glCopyTexSubImage2D (RTT emulado = stall de GXM).
+- Sonido de disparos perdido con fuego sostenido: hipótesis = hilo mezclador
+  de Vox atrasado (prioridad default, igual que el juego) -> sube a
+  0x100000E0 en su primer AudioTrack.write. Sin confirmar.
+- Sonido (dato del usuario): los disparos mudos SOLO volvían pausando y
+  despausando. Despausa = VoxSoundManager::ResumeAllSounds ->
+  vox::VoxEngine::ResumeAllEmitters => los emisores nuevos quedan en PAUSA (no
+  es falta de voces ni el hilo de mezcla). En VoxSoundManager::Play, un SFX
+  se crea con Play+Pause si el flag de "sombra" (+0x80, máscara +0x84,
+  ShadowMusic) cubre su grupo. Quién lo activa en juego: sin ubicar.
+  Mitigación: main.c llama ResumeAllSounds al soltar disparo/cohetes (máx.
+  cada 2 s), igual que la despausa. La subida de prioridad de audio se deja.
+
+## Fase 26: reparto de núcleos (2026-11-22, build OK, sin consola)
+- Ningún hilo fijaba núcleo; en la Vita un hilo sin máscara hereda el del
+  creador -> todo lo creado por el motor desde el hilo principal corría en
+  el núcleo 0 junto al juego.
+- Núcleo 0: solo el hilo principal (main.c). Hilos pthread del motor:
+  trampolín en pthread_create_soloader -> núcleos 1|2. Vox (AudioTrack.write),
+  audio del intro y de cinemáticas: núcleo 2. GC de vitaGL: núcleo 1.
+- CPU 444 / bus 222 / GPU 222 / xbar 166 ya estaban (init.c). El núcleo 3 es
+  del sistema. El motor es de un solo hilo: lógica + render no se parten.
+
+## Fase 27: crash en free() desde vox::DataObj::UnregisterEmitter (2026-11-23, build OK, sin consola)
+- Log nova2_0034 + dump: data abort en `_free_r` (newlib), hilo pthread de Vox:
+  UpdateEmittersThreaded -> UpdateEmitters -> RemoveEmitter -> KillEmitter ->
+  DataObj::UnregisterEmitter -> VoxFree. Lista de emitters corrupta = doble free.
+- Causa: aparece con la Fase 26 (hilos del motor ahora en paralelo real en
+  núcleos 1-2). El init perezoso de mutex/cond en reimpl/pthr.c era
+  check (`isObjectInitialized`) + init (`rememberObject`) en dos secciones
+  críticas separadas -> dos hilos podían crear dos mutex distintos para el
+  mismo objeto. Además el registro tenía 1024 entradas: lleno, cada lock creaba
+  un mutex nuevo (sin exclusión); y una dirección reusada sin destroy hacía que
+  pthread_mutex_init se saltara y quedara real_ptr con basura.
+- Fix: sin registro. Init explícito siempre crea uno nuevo; init perezoso solo
+  si real_ptr es un PTHREAD_*_INITIALIZER de bionic (0/0x4000/0x8000), con CAS.
+
+## Fase 28: disparos que cortan el resto del audio (2026-11-23, build OK, sin consola)
+- VoxSoundManager::Init: SetPriorityBank(0, INT_MIN+1, this+0x6c, 2) -- un solo
+  banco, modo 2 = al llenarse roba al emisor más viejo de igual prioridad. El
+  ctor pone +0x6c = 128 si Platform::s_isOpenGLES2, si no 7. Con 7, una ráfaga
+  de disparos mata música/SFX (PriorityBankManager::RemoveEmitter ->
+  KillEmitter en el stack del dump 0034).
+- patch.c `patch_vox_voices`: moveq r3,#7 -> #32 en los dos ctors (0x236994,
+  0x236884). Log `BOOT: Vox isOpenGLES2=%d maxEmitters=%d` tras nativeResize
+  para confirmar en consola cuál rama tomaba (si ya era 128, el corte es otro).
+- Hilo mezclador Vox (AudioTrack.write): prioridad 0x100000E0 -> 0x40 en el
+  núcleo 2, como el mezclador de Asphalt-5-Vita.
+
+## Fase 29: abort del preprocesador GLSL + bucle de disparo mudo (2026-11-23, build OK, sin consola)
+- Log 0035: `Vox isOpenGLES2=1 maxEmitters=128` -> el límite de 7 voces de la
+  Fase 28 nunca aplicaba; patch_vox_voices y el log quitados. Prioridad 0x40
+  del mezclador se mantiene.
+- Dump 0035 (hilo principal): abort <- __verbose_terminate_handler <-
+  __cxa_throw <- vitaGL preprocessor::wrtError ("ERROR, line 2, ..."). Un
+  shader del juego hace fallar el preprocesador de vitaGL; la excepción
+  std::string no tenía catch. Fix en lib/vitagl preprocessor.cpp
+  glsl_preprocessor_run: try/catch -> se usa el shader sin preprocesar y se
+  añade a ux0:data/nova2/glsl_pp_errors.txt (error + fuente) para ver cuál es.
+- Disparo mudo: CWeaponComponent::FireStartSound solo hace Play (loop) si el
+  handle this+0x120 es -1; solo FireStopSound lo resetea. Emisor en pausa/
+  perdido = handle válido pero mudo hasta ResumeAllSounds. Hook en patch.c:
+  mismo código + si IsPlayingByHandleId==0 -> StopByHandleId y Play nuevo, y
+  ResumeByHandleId tras Play. Mitigación ResumeAllSounds de main.c sigue.
+
+## Fase 30: capturador de errores fatales (2026-11-23, build OK, sin consola)
+- `source/crash_guard.c` + `crash_guard_cxx.cpp`: en vez de colgarse/volcar
+  psp2dmp, escribe `ux0:data/nova2/crash_report.txt` (tipo, hilo, PC/LR como
+  libnova2.so+off (símbolo+off) o dirección del eboot, FAR, registros,
+  direcciones de código en la pila) y muestra un diálogo al usuario; luego
+  sale limpio.
+- Cubre: data/prefetch abort (kuKernelRegisterAbortHandler, p. ej. dump 0034),
+  excepción C++ sin catch (std::set_terminate con el texto, dump 0035),
+  abort() del eboot (-Wl,--wrap=abort), abort/__stack_chk_fail/
+  __android_log_assert del .so (sys.c/log.c).
+- No cubre: undefined instruction real (kubridge solo da data/prefetch), y
+  cuelgues sin fallo.
+- psp2dmp se conserva: tras cerrar el diálogo, abort_handler libera el handler
+  de kubridge y retorna -> se restaura el contexto, la misma instrucción vuelve
+  a fallar y el sistema escribe el dump con los registros originales. Errores
+  de software (abort/excepción/assert): se libera el handler y se escribe en
+  NULL a propósito -> dump del hilo que falló.
+- Sin malloc/stdio/logger tras el fallo (heap/locks pueden estar rotos). El
+  diálogo lo pinta un hilo "crash_ui"; el hilo de render se detiene en gl_swap
+  (crash_guard_poll). Prueba: crear ux0:data/nova2/crash_test -> fallo forzado
+  a los ~10 s.

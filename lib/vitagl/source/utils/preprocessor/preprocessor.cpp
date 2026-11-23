@@ -1,3 +1,4 @@
+#include <cstdio>
 // Credits: https://github.com/john-blackburn/preprocessor
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -2145,7 +2146,22 @@ char *glsl_preprocessor_run(char *mode, const char *infile) {
 	defines.push_back("#define GL_ES 1");
 	defines.push_back("#define VITAGL");
 	std::map<std::string, std::string> hasCppAttributeMap;
-	out = preprocessor::preprocess(mode, infile, "", defines, dummy, dummy, dummy, hasCppAttributeMap, false);
+	// Port N.O.V.A 2: un error del preprocesador lanzaba std::string sin catch
+	// -> std::terminate -> abort (dump 0035, "ERROR, line 2"). Se usa el shader
+	// sin preprocesar (shaccCg tiene su propio preprocesador) y se guarda el
+	// shader que falló en ux0:data/nova2/glsl_pp_errors.txt.
+	try {
+		out = preprocessor::preprocess(mode, infile, "", defines, dummy, dummy, dummy, hasCppAttributeMap, false);
+	} catch (...) {
+		std::string err = "unknown";
+		try { throw; } catch (const std::string &e) { err = e; } catch (const char *e) { err = e; } catch (...) {}
+		FILE *f = fopen("ux0:data/nova2/glsl_pp_errors.txt", "a");
+		if (f) {
+			fprintf(f, "=== %s\n%s\n", err.c_str(), infile);
+			fclose(f);
+		}
+		out = infile;
+	}
 	return (char *)out.c_str();
 }
 
